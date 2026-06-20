@@ -1,0 +1,21 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# audio/video files
+*.mp3
+*.wav
+*.m4a
+*.mp4
+*.mov
+
+# generated outputs
+*_raw.json
+*_finalcuts.json
+*_dropped.json
+*_uncertain.json
+*_review.csv
+*_audacity.txt
+
+.DS_Store

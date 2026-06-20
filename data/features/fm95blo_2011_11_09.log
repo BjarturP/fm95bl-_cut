@@ -1,0 +1,27 @@
+  processed 0s - 300s / 7520s
+  processed 300s - 600s / 7520s
+  processed 600s - 900s / 7520s
+  processed 900s - 1200s / 7520s
+  processed 1200s - 1500s / 7520s
+  processed 1500s - 1800s / 7520s
+  processed 1800s - 2100s / 7520s
+  processed 2100s - 2400s / 7520s
+  processed 2400s - 2700s / 7520s
+  processed 2700s - 3000s / 7520s
+  processed 3000s - 3300s / 7520s
+  processed 3300s - 3600s / 7520s
+  processed 3600s - 3900s / 7520s
+  processed 3900s - 4200s / 7520s
+  processed 4200s - 4500s / 7520s
+  processed 4500s - 4800s / 7520s
+  processed 4800s - 5100s / 7520s
+  processed 5100s - 5400s / 7520s
+  processed 5400s - 5700s / 7520s
+  processed 5700s - 6000s / 7520s
+  processed 6000s - 6300s / 7520s
+  processed 6300s - 6600s / 7520s
+  processed 6600s - 6900s / 7520s
+  processed 6900s - 7200s / 7520s
+  processed 7200s - 7500s / 7520s
+  processed 7500s - 7520s / 7520s
+Wrote features to data/features/fm95blo_2011_11_09.json (2 silence runs, 41 loudness jumps)
