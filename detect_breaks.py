@@ -37,30 +37,8 @@ def word_rate_series(transcript: dict, timestamps: list, window: float) -> list:
     return rates
 
 
-def confidence_series(transcript: dict, timestamps: list, window: float) -> list:
-    """Rolling average of Whisper's per-segment avg_logprob (transcription
-    confidence) centered at each timestamp. Word-rate alone misses quiet/
-    garbled real speech (few words recognized, but the ones that are still
-    score as low-confidence guesses) -- calibration on fm95blo_2011_11_09
-    found this is a real, validated-across-the-whole-episode signal for
-    that case: real host talk averages around -0.97 avg_logprob across all
-    11 labeled talk gaps, vs -0.58 across all 15 labeled music/ad segments.
-    Defaults to 0.0 (neutral, reads as "not speech") for windows with no
-    transcribed segments at all -- true silence/instrumental stretches
-    shouldn't get flagged as speech just for lacking data either way."""
-    segs = sorted(transcript["segments"], key=lambda s: s["start"])
-    seg_starts = [s["start"] for s in segs]
-    out = []
-    for t in timestamps:
-        lo = bisect.bisect_left(seg_starts, t - window)
-        hi = bisect.bisect_right(seg_starts, t + window)
-        vals = [segs[i]["avg_logprob"] for i in range(lo, hi) if segs[i]["end"] > t - window and segs[i]["start"] < t + window]
-        out.append(sum(vals) / len(vals) if vals else 0.0)
-    return out
-
-
 def build_combined_timeline(transcript: dict, features: dict) -> tuple:
-    """Shared (timestamps, rate_norm, combined, logprob) arrays used both for
+    """Shared (timestamps, rate_norm, combined) arrays used both for
     music-run detection and for the merge/expand post-processing below -- one
     signal, reused everywhere instead of recomputed differently in different
     places."""
@@ -73,24 +51,7 @@ def build_combined_timeline(transcript: dict, features: dict) -> tuple:
         + config.MUSIC_COMBINE_WEIGHT_WORDRATE * (1 - rn)
         for w, rn in zip(windows, rate_norm)
     ]
-    logprob = confidence_series(transcript, timestamps, config.AVG_LOGPROB_WINDOW)
-    return timestamps, rate_norm, combined, logprob
-
-
-def host_speech_detected(t0: float, t1: float, timestamps: list, rate_norm: list, logprob: list) -> bool:
-    """Is there real host speech between t0 and t1? True if EITHER word-rate
-    is high (lots of recognized words -- normal conversation) OR average
-    transcription confidence is low (avg_logprob below threshold -- quiet or
-    garbled speech that word-rate alone misses, since few words got
-    recognized but the ones that did are low-confidence guesses rather than
-    confident hallucinated "lyrics"). OR, not AND: this only gates whether
-    we bridge a gap or trim a boundary, and erring toward "yes, real speech"
-    here just means staying more conservative (leaving a real break split
-    into more pieces) rather than wrongly cutting real talk -- the safer
-    failure direction per the project's false-positives-are-worse rule."""
-    avg_rate = _avg_in_range(t0, t1, timestamps, rate_norm)
-    avg_logprob = _avg_in_range(t0, t1, timestamps, logprob)
-    return avg_rate >= config.MERGE_GAP_SPEECH_RATE_NORM or avg_logprob < config.AVG_LOGPROB_HOST_SPEECH_THRESHOLD
+    return timestamps, rate_norm, combined
 
 
 def compute_music_runs(transcript: dict, features: dict) -> list:

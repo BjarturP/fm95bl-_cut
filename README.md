@@ -124,34 +124,47 @@ python export.py \
   + `expand_boundaries`) after the initial per-window detection: it bridges
   candidates across gaps up to `MERGE_GAP_MAX` seconds when there's no real
   host speech in between, and grows each boundary outward until it hits a
-  sustained run of clear speech. This took the same episode from 29 raw
-  per-window candidates / ~73% recall (30%-coverage criterion) / 5 false
-  positives to **23 final candidates / 93.33% recall (14 of 15 ground-truth
-  breaks) / 3 false positives**. Both `data/candidates/<episode>.json`
-  (final, merged+expanded -- what you should review/cut from) and
-  `data/candidates/<episode>_raw.json` (pre-merge, for debugging the
-  detector itself) are written by `detect_breaks.py`.
-- The one remaining missed break (1:05:35-1:12:37, "music") is a known hard
-  case: this song has both a low acoustic music_score (~0.2-0.4, not
-  obviously "tonal" to the heuristic) *and* sung lyrics that Whisper
-  transcribes as if they were spoken words, so the word-rate signal reads
-  as real speech too -- it defeats both halves of the combined signal at
-  once. Each half alone was added specifically to cover the other's blind
-  spot (percussive songs vs. low-lyric-density talk), but a sung song with
-  a weak acoustic signature beats both. Likely needs a new signal (e.g.
-  Whisper's per-segment confidence/no-speech probability, since garbled
-  "transcribed" lyrics tend to have low confidence) -- not yet implemented,
-  revisit once more labeled episodes show whether this is common.
-- The 3 remaining false positives are all heavily garbled Whisper output
+  sustained run of clear speech. Current state on this episode: **19 final
+  candidates / 66.67% recall (10 of 15 ground-truth breaks) / 3 false
+  positives** at the review (stage 2) level, **13 final cuts / 73.33% recall
+  (11 of 15) / 2 false positives** after the stage-3 precision pass. Both
+  `data/candidates/<episode>.json` (final, merged+expanded -- what you
+  should review/cut from) and `data/candidates/<episode>_raw.json`
+  (pre-merge, for debugging the detector itself) are written by
+  `detect_breaks.py`. (An earlier pass through this README claimed 93.33%
+  recall / 3 false positives -- that number predates later config/threshold
+  changes and is no longer reproducible from the current code + config; the
+  numbers above are from re-running the current pipeline end to end.)
+- 4 of the 5 remaining missed breaks involve the same root cause as the
+  known hard case below: low acoustic music_score *and* a word-rate signal
+  that reads as real speech (either sung lyrics Whisper transcribes as
+  spoken words, or genuinely sparse-but-real host talk that still produces
+  enough recognized words to clear the speech threshold) -- it defeats both
+  halves of the combined signal at once.
+  - **Tried and reverted:** added Whisper's per-segment `avg_logprob`
+    (transcription confidence) as a third signal, on the theory that
+    hallucinated "lyrics" would be lower-confidence than real speech. A
+    91s-clip-level probe (`probe_confidence.py`,
+    `data/confidence_probe/<episode>.json`) showed real separation (talk
+    mean -0.91 vs music mean -0.46), but wiring it into the per-window
+    (`AVG_LOGPROB_WINDOW`-sized) merge-gating logic and A/B testing against
+    the labeled episode showed it added a false positive with **zero**
+    recall improvement -- per-window avg_logprob is much noisier than the
+    90s-clip averages that motivated it. Reverted; the code no longer
+    computes or uses it. `no_speech_prob` (also captured per-segment in
+    `transcribe.py`'s output, unused) may be worth trying instead, since
+    it's a more direct VAD-style signal than confidence -- not yet tried.
+  - Revisit once more labeled episodes show whether this is common enough
+    to be worth a new signal at all.
+- The 3 review-stage false positives are all heavily garbled Whisper output
   over real host conversation (the `small` model mistranscribes Icelandic
-  badly in places), not actual breaks: one is a stray acoustic
-  "music-like" blip on quiet talk, one is the host literally saying
-  "FM95" mid-conversation (not a station-ID jingle) tripping the keyword
-  list, and one is a quiet talk-show game-segment pause (the
-  silence+music+loudness-jump combination below). None of their confidence
-  scores (0.40 / 0.35 / 0.80) reach `AUTO_REMOVE_CONFIDENCE`, so none of
-  them would actually get auto-cut -- they show up as "review" rows, not
-  "remove" rows, in the CSV.
+  badly in places), not actual breaks -- stray acoustic "music-like" blips
+  on quiet talk. None of their confidence scores reach
+  `AUTO_REMOVE_CONFIDENCE`, so none of them would actually get auto-cut --
+  they show up as "review" rows, not "remove" rows, in the CSV. The
+  stage-3 precision pass (`finalize_cuts.py`) drops one further false
+  positive (an unsupported keyword-only "fm95" mid-conversation hit) by
+  design, leaving 2 in the final cuts.
 - Spoken ad reads are NOT acoustically distinct from normal talk on this
   show -- they rely on the (currently thin) `BREAK_KEYWORDS` list and stay
   low-confidence by design. Expect to manually extend ad boundaries in
