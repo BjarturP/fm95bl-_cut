@@ -1,65 +1,47 @@
 [
   {
-    "start": 12.0,
-    "end": 69.3,
-    "duration": 57.3,
+    "start": 0.0,
+    "end": 98.0,
+    "duration": 98.0,
     "confidence": 0.35,
     "reasons": [
       "keyword-only:\"facebook\" (no acoustic support)",
-      "expanded-start"
+      "expanded-start",
+      "expanded-end"
     ]
   },
   {
     "start": 112.0,
-    "end": 208.0,
-    "duration": 96.0,
-    "confidence": 0.4,
-    "reasons": [
-      "music-like:67.0s",
-      "expanded-start",
-      "expanded-end"
-    ]
-  },
-  {
-    "start": 236.0,
-    "end": 306.0,
-    "duration": 70.0,
-    "confidence": 0.4,
-    "reasons": [
-      "music-like:50.0s",
-      "expanded-start",
-      "expanded-end"
-    ]
-  },
-  {
-    "start": 327.0,
     "end": 378.0,
-    "duration": 51.0,
+    "duration": 266.0,
     "confidence": 0.4,
     "reasons": [
-      "music-like:26.0s",
+      "music-like:254.0s",
       "expanded-start"
+    ]
+  },
+  {
+    "start": 404.0,
+    "end": 573.0,
+    "duration": 169.0,
+    "confidence": 0.4,
+    "reasons": [
+      "music-like:42.0s",
+      "expanded-start",
+      "expanded-end",
+      "music-like:25.0s"
     ]
   },
   {
     "start": 598.0,
-    "end": 826.0,
-    "duration": 228.0,
+    "end": 1166.0,
+    "duration": 568.0,
     "confidence": 0.4,
     "reasons": [
       "music-like:217.0s",
       "expanded-start",
-      "expanded-end"
-    ]
-  },
-  {
-    "start": 860.0,
-    "end": 908.0,
-    "duration": 48.0,
-    "confidence": 0.4,
-    "reasons": [
-      "music-like:37.0s",
-      "expanded-start"
+      "expanded-end",
+      "music-like:294.0s"
     ]
   },
   {
@@ -76,40 +58,42 @@
   },
   {
     "start": 1976.0,
-    "end": 2213.0,
-    "duration": 237.0,
+    "end": 2244.0,
+    "duration": 268.0,
     "confidence": 0.4,
     "reasons": [
       "music-like:53.0s",
       "merged-gap:46s",
-      "music-like:119.0s",
-      "expanded-start"
+      "music-like:137.0s",
+      "expanded-start",
+      "expanded-end"
     ]
   },
   {
-    "start": 2547.0,
+    "start": 2530.0,
     "end": 2924.0,
-    "duration": 377.0,
+    "duration": 394.0,
     "confidence": 0.8,
     "reasons": [
       "keyword-only:\"krónur\" (no acoustic support)",
       "keyword-only:\"facebook\" (no acoustic support)",
       "keyword-only:\"sími\" (no acoustic support)",
       "keyword-only:\"fm95\" (no acoustic support)",
-      "music-like:59.0s",
+      "music-like:108.0s",
       "keyword:\"fm95\"",
       "expanded-start",
       "expanded-end"
     ]
   },
   {
-    "start": 2991.0,
-    "end": 3045.0,
-    "duration": 54.0,
+    "start": 2941.0,
+    "end": 3070.0,
+    "duration": 129.0,
     "confidence": 0.4,
     "reasons": [
-      "music-like:40.0s",
-      "expanded-start"
+      "music-like:62.0s",
+      "expanded-start",
+      "expanded-end"
     ]
   },
   {
@@ -124,9 +108,9 @@
     ]
   },
   {
-    "start": 3661.0,
-    "end": 3738.0,
-    "duration": 77.0,
+    "start": 3643.0,
+    "end": 3775.0,
+    "duration": 132.0,
     "confidence": 0.5,
     "reasons": [
       "music-like:56.0s",
@@ -136,9 +120,9 @@
     ]
   },
   {
-    "start": 3922.0,
+    "start": 3888.0,
     "end": 4328.0,
-    "duration": 406.0,
+    "duration": 440.0,
     "confidence": 0.4,
     "reasons": [
       "music-like:341.0s",
@@ -147,16 +131,29 @@
     ]
   },
   {
-    "start": 4548.0,
-    "end": 4921.0,
-    "duration": 373.0,
+    "start": 4377.0,
+    "end": 4449.0,
+    "duration": 72.0,
     "confidence": 0.4,
     "reasons": [
-      "music-like:301.0s",
+      "music-like:37.0s",
       "expanded-start",
-      "expanded-end",
-      "silence:11.0s",
-      "loudness-jump"
+      "expanded-end"
+    ]
+  },
+  {
+    "start": 4480.0,
+    "end": 4921.0,
+    "duration": 441.0,
+    "confidence": 0.8,
+    "reasons": [
+      "music-like:48.0s",
+      "merged-gap:7s",
+      "silence:361.0s",
+      "music-like:361.0s",
+      "loudness-jump",
+      "expanded-start",
+      "expanded-end"
     ]
   },
   {
@@ -178,43 +175,43 @@
     "reasons": [
       "keyword-only:\"facebook\" (no acoustic support)",
       "merged-gap:8s",
-      "music-like:82.0s",
+      "music-like:124.0s",
       "expanded-start",
       "expanded-end"
     ]
   },
   {
     "start": 5605.0,
-    "end": 5673.0,
-    "duration": 68.0,
+    "end": 5917.0,
+    "duration": 312.0,
     "confidence": 0.4,
     "reasons": [
-      "music-like:56.0s",
-      "expanded-start",
-      "expanded-end"
-    ]
-  },
-  {
-    "start": 5717.0,
-    "end": 5874.0,
-    "duration": 157.0,
-    "confidence": 0.4,
-    "reasons": [
-      "music-like:20.0s",
+      "music-like:165.0s",
       "merged-gap:68s",
-      "music-like:23.0s",
+      "music-like:58.0s",
       "expanded-start",
       "expanded-end"
     ]
   },
   {
-    "start": 6614.0,
-    "end": 7264.0,
-    "duration": 650.0,
+    "start": 5976.0,
+    "end": 6033.0,
+    "duration": 57.0,
+    "confidence": 0.4,
+    "reasons": [
+      "music-like:46.0s",
+      "expanded-start",
+      "expanded-end"
+    ]
+  },
+  {
+    "start": 6592.0,
+    "end": 7291.0,
+    "duration": 699.0,
     "confidence": 0.8,
     "reasons": [
-      "silence:636.0s",
-      "music-like:636.0s",
+      "silence:661.0s",
+      "music-like:661.0s",
       "loudness-jump",
       "expanded-start",
       "expanded-end"

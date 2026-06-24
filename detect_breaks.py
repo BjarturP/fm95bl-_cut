@@ -37,19 +37,54 @@ def word_rate_series(transcript: dict, timestamps: list, window: float) -> list:
     return rates
 
 
+def no_speech_prob_series(transcript: dict, timestamps: list, window: float) -> list:
+    """Rolling average of Whisper's per-segment no_speech_prob centered at
+    each timestamp. Defaults to 1.0 (maximally "not speech") for windows
+    with no transcribed segments nearby -- no segment transcribed there at
+    all is itself evidence of non-speech for this signal, unlike
+    word_rate_series where 0 words just means "didn't catch any."""
+    segs = sorted(transcript["segments"], key=lambda s: s["start"])
+    seg_starts = [s["start"] for s in segs]
+    out = []
+    for t in timestamps:
+        lo = bisect.bisect_left(seg_starts, t - window)
+        hi = bisect.bisect_right(seg_starts, t + window)
+        vals = [
+            segs[i]["no_speech_prob"]
+            for i in range(lo, hi)
+            if segs[i]["end"] > t - window and segs[i]["start"] < t + window
+        ]
+        out.append(sum(vals) / len(vals) if vals else 1.0)
+    return out
+
+
 def build_combined_timeline(transcript: dict, features: dict) -> tuple:
     """Shared (timestamps, rate_norm, combined) arrays used both for
     music-run detection and for the merge/expand post-processing below -- one
     signal, reused everywhere instead of recomputed differently in different
-    places."""
+    places.
+
+    The non-speech component is max(1 - rate_norm, no_speech_prob), not
+    word-rate alone: sung lyrics that Whisper transcribes as if they were
+    spoken words defeat word-rate (it reads as real speech) but tend to have
+    high no_speech_prob (Whisper's own estimate that the segment isn't
+    speech), and either signal alone catching it is enough. Validated via
+    experiments/no_speech_prob.py (variant "nsp_or") against the one labeled
+    episode: improved final-cuts recall 73.33% -> 80.00% AND precision
+    84.62% -> 90.91% over plain word-rate. (A similar attempt using
+    avg_logprob/transcription-confidence instead was tried and reverted --
+    it added a false positive with no recall gain; no_speech_prob is a more
+    direct VAD-style signal and behaved differently.)"""
     windows = features["windows"]
     timestamps = [w["t"] for w in windows]
     rates = word_rate_series(transcript, timestamps, config.WORD_RATE_WINDOW)
     rate_norm = [min(r / config.WORD_RATE_NORM_CAP, 1.0) for r in rates]
+    nsp = no_speech_prob_series(transcript, timestamps, config.WORD_RATE_WINDOW)
+    non_speech = [max(1 - rn, n) for rn, n in zip(rate_norm, nsp)]
     combined = [
         config.MUSIC_COMBINE_WEIGHT_ACOUSTIC * w["music_score"]
-        + config.MUSIC_COMBINE_WEIGHT_WORDRATE * (1 - rn)
-        for w, rn in zip(windows, rate_norm)
+        + config.MUSIC_COMBINE_WEIGHT_WORDRATE * ns
+        for w, ns in zip(windows, non_speech)
     ]
     return timestamps, rate_norm, combined
 

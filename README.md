@@ -124,47 +124,51 @@ python export.py \
   + `expand_boundaries`) after the initial per-window detection: it bridges
   candidates across gaps up to `MERGE_GAP_MAX` seconds when there's no real
   host speech in between, and grows each boundary outward until it hits a
-  sustained run of clear speech. Current state on this episode: **19 final
-  candidates / 66.67% recall (10 of 15 ground-truth breaks) / 3 false
-  positives** at the review (stage 2) level, **13 final cuts / 73.33% recall
-  (11 of 15) / 2 false positives** after the stage-3 precision pass. Both
-  `data/candidates/<episode>.json` (final, merged+expanded -- what you
-  should review/cut from) and `data/candidates/<episode>_raw.json`
-  (pre-merge, for debugging the detector itself) are written by
-  `detect_breaks.py`. (An earlier pass through this README claimed 93.33%
-  recall / 3 false positives -- that number predates later config/threshold
-  changes and is no longer reproducible from the current code + config; the
-  numbers above are from re-running the current pipeline end to end.)
-- 4 of the 5 remaining missed breaks involve the same root cause as the
-  known hard case below: low acoustic music_score *and* a word-rate signal
-  that reads as real speech (either sung lyrics Whisper transcribes as
-  spoken words, or genuinely sparse-but-real host talk that still produces
-  enough recognized words to clear the speech threshold) -- it defeats both
-  halves of the combined signal at once.
-  - **Tried and reverted:** added Whisper's per-segment `avg_logprob`
-    (transcription confidence) as a third signal, on the theory that
-    hallucinated "lyrics" would be lower-confidence than real speech. A
-    91s-clip-level probe (`probe_confidence.py`,
+  sustained run of clear speech. Both `data/candidates/<episode>.json`
+  (final, merged+expanded -- what you should review/cut from) and
+  `data/candidates/<episode>_raw.json` (pre-merge, for debugging the
+  detector itself) are written by `detect_breaks.py`.
+- **Non-speech signal: word-rate OR no_speech_prob.** The combined
+  music-likeness score's word-rate component was originally `1 - rate_norm`
+  alone. Sung lyrics that Whisper transcribes as if they were spoken words
+  defeat that (it reads as real speech), so `build_combined_timeline` now
+  uses `max(1 - rate_norm, no_speech_prob)` instead -- either signal
+  flagging non-speech is enough, since no_speech_prob (Whisper's own
+  per-segment estimate of whether a segment is speech at all) tends to stay
+  high through sung/garbled stretches even when word-rate doesn't. Validated
+  via `experiments/no_speech_prob.py` (run it to reproduce) against this
+  episode before promoting into `detect_breaks.py`:
+  | stage | candidates | recall | precision |
+  |---|---|---|---|
+  | review (word-rate only, prior) | 19 | 66.67% (10/15) | 84.21% (3 FP) |
+  | review (word-rate OR no_speech_prob) | 18 | 86.67% (13/15) | 72.22% (5 FP) |
+  | final cuts (word-rate only, prior) | 13 | 73.33% (11/15) | 84.62% (2 FP) |
+  | final cuts (word-rate OR no_speech_prob, current) | 11 | **80.00% (12/15)** | **90.91% (1 FP)** |
+
+  Final cuts improved on both recall and precision, not a tradeoff -- the
+  stage-3 precision pass cleans up the review stage's extra false positives
+  as designed. Remaining 3 missed breaks: 3376-3600s and 6188-6381s
+  ("music", both still 0-35% coverage) and 5010-5252s ("ads", keyword-only,
+  no acoustic support). Remaining 1 false positive: 5976-6033s
+  (conf=0.40, stray "music-like" reading on quiet talk, below
+  `AUTO_REMOVE_CONFIDENCE` so it would show as a review row, not an
+  auto-removed one).
+  - **Tried and reverted (earlier session):** added Whisper's per-segment
+    `avg_logprob` (transcription confidence) as a third signal instead, on
+    the theory that hallucinated "lyrics" would be lower-confidence than
+    real speech. A 90s-clip-level probe (`probe_confidence.py`,
     `data/confidence_probe/<episode>.json`) showed real separation (talk
     mean -0.91 vs music mean -0.46), but wiring it into the per-window
-    (`AVG_LOGPROB_WINDOW`-sized) merge-gating logic and A/B testing against
-    the labeled episode showed it added a false positive with **zero**
-    recall improvement -- per-window avg_logprob is much noisier than the
-    90s-clip averages that motivated it. Reverted; the code no longer
-    computes or uses it. `no_speech_prob` (also captured per-segment in
-    `transcribe.py`'s output, unused) may be worth trying instead, since
-    it's a more direct VAD-style signal than confidence -- not yet tried.
-  - Revisit once more labeled episodes show whether this is common enough
-    to be worth a new signal at all.
-- The 3 review-stage false positives are all heavily garbled Whisper output
-  over real host conversation (the `small` model mistranscribes Icelandic
-  badly in places), not actual breaks -- stray acoustic "music-like" blips
-  on quiet talk. None of their confidence scores reach
-  `AUTO_REMOVE_CONFIDENCE`, so none of them would actually get auto-cut --
-  they show up as "review" rows, not "remove" rows, in the CSV. The
-  stage-3 precision pass (`finalize_cuts.py`) drops one further false
-  positive (an unsupported keyword-only "fm95" mid-conversation hit) by
-  design, leaving 2 in the final cuts.
+    merge-gating logic and A/B testing against the labeled episode showed
+    it added a false positive with **zero** recall improvement --
+    per-window avg_logprob is much noisier than the 90s-clip averages that
+    motivated it. Reverted; the code no longer computes or uses it.
+    `no_speech_prob` (above) is a more direct VAD-style signal and behaved
+    very differently in the same per-window setting.
+  - Revisit once more labeled episodes show whether these numbers hold up
+    outside this one episode -- both changes above were validated against
+    only one labeled episode, per the project's own anti-overfitting
+    caution (see "Calibrating against your labeled example episode" above).
 - Spoken ad reads are NOT acoustically distinct from normal talk on this
   show -- they rely on the (currently thin) `BREAK_KEYWORDS` list and stay
   low-confidence by design. Expect to manually extend ad boundaries in
