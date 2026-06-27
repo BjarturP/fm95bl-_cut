@@ -48,16 +48,42 @@ python finalize_cuts.py \
     --transcript data/transcripts/episode1.json \
     --features data/features/episode1.json
 
-# 6. Export a reviewable report + Audacity label file (from the final cuts,
-#    not the raw review candidates)
+# 6. Export a reviewable CSV + Audacity label file (from the final cuts)
 python review_export.py \
     --candidates data/candidates/episode1_finalcuts.json \
     --out-csv data/labels/episode1_review.csv \
     --out-audacity data/labels/episode1_audacity.txt
 
-# 7. Review: edit the `decision` column in the CSV (remove/keep), or import
-#    the Audacity label file, adjust boundaries on the waveform, delete any
-#    false-positive labels, then re-export labels from Audacity.
+# 6b. (Optional) Run Shazam on heuristic candidate regions to identify songs
+#     and refine cut boundaries
+python experiments/shazam_detect.py \
+    --audio data/raw/episode1.mp3 \
+    --candidates data/candidates/episode1_finalcuts.json \
+    --episode-name episode1
+
+# 6c. (Optional) Run Shazam gap-scan to find music the heuristic missed
+#     entirely -- scans large gaps between finalcut candidates at 45s intervals
+python experiments/shazam_gap_scan.py \
+    --audio data/raw/episode1.mp3 \
+    --candidates data/candidates/episode1_finalcuts.json \
+    --episode-name episode1
+
+# 6d. Build the combined review package (merges heuristic + both Shazam passes)
+python experiments/make_review.py \
+    --heuristic-csv    data/labels/episode1_review.csv \
+    --shazam-json      data/labels/song_matches_episode1.json \
+    --shazam-unmatched data/labels/song_unmatched_episode1.csv \
+    --gap-shazam-json  data/labels/gap_shazam_matches_episode1.json \
+    --episode-name     episode1
+# → data/labels/review_sheet_episode1.csv   (open in Numbers/Excel)
+# → data/labels/review_audacity_episode1.txt (import into Audacity)
+
+# 7. Review: import review_audacity_*.txt into Audacity. Label types:
+#      [H ...]               heuristic pipeline candidate
+#      [S ✓/⚠ ...]          Shazam-matched song (boundaries ok / uncertain)
+#      [GAP-SHAZAM ✓/⚠ ...] gap-scan match (song heuristic missed entirely)
+#    Fill in actual_start / actual_end / label / notes in review_sheet_*.csv.
+#    All gap-shazam matches are review-only -- do not auto-cut from them yet.
 
 # 8. Cut and export the cleaned episode
 python export.py \
@@ -83,6 +109,25 @@ python export.py \
 - Run stage 5 (`review_export.py`) against `*_finalcuts.json`, not the raw
   stage-2 output -- that's the list you should actually be reviewing/cutting
   from.
+
+### Shazam detection layer (experimental, `experiments/`)
+
+Two optional Shazam passes run on top of the heuristic pipeline and are
+combined into the review package via `make_review.py`:
+
+- **`shazam_detect.py`** -- runs Shazam on heuristic candidate regions to
+  identify songs and compute precise cut boundaries from offset + duration.
+- **`shazam_gap_scan.py`** -- scans large gaps (default ≥3 min) between
+  finalcut candidates at 45s intervals with 15s clips. Finds songs the
+  heuristic never produced a candidate for at all. Validated on two episodes:
+  found Pitbull "Give Me Everything" (GT08, 2012) and Florence + the Machine
+  "Shake It Out" + Daughtry "Crawling Back to You" (two missed breaks, 2011).
+  Zero false positives in genuinely silent gaps across both runs.
+
+All Shazam and gap-scan matches are **review-only** -- `make_review.py`
+includes them in the Audacity label file and review CSV as suggestions, but
+they are never auto-cut. Do not raise confidence or auto-remove thresholds
+based on Shazam results until more episodes are labeled.
 
 ## Calibrating against your labeled example episode
 
