@@ -1,42 +1,34 @@
 """
-Shazam-based song detection with multi-source duration lookup.
+Shazam-based song detection with multi-sample boundary estimation.
 
-Replaces the AcoustID approach with Shazam recognition (no API key needed,
-much broader database including Icelandic music), then tries multiple sources
-for song duration so cut boundaries can be estimated precisely.
+Instead of one clip per region, sweeps multiple clips across each candidate.
+Multiple offsets → cluster estimated song_start values → median if they agree,
+UNCERTAIN if they spread >30s.
 
-Duration lookup order:
-  1. iTunes API via Shazam's trackadamid (when present)
-  2. MusicBrainz search by artist + title (free, no auth)
-  3. Spotify search (needs SPOTIFY_CLIENT_ID + SPOTIFY_CLIENT_SECRET env vars)
-  4. Fall back to heuristic region boundaries
+End boundary uses:
+  1. Song presence window: last matched sample gives a minimum on song length.
+  2. End scan: a few extra clips probed past the region end.
+  3. Acoustic snap: nearest music↔speech transition in features/transcript.
 
-Boundary logic:
-  - song_start_in_episode = clip_start - shazam_offset
-  - song_end_in_episode   = song_start + duration
-  - Clamped to region with BOUNDARY_SLACK tolerance
-  - Padded by PRE_PADDING / POST_PADDING
-  - Flagged "uncertain" if estimated boundaries are implausible
-
-IMPORTANT: Do not trust official duration blindly. Radio edits, early fades,
-and talk-over at the intro/outro are common. Suggested cuts are always marked
-for review, never auto-applied.
+Boundary confidence:
+  HIGH   — ≥3 matching samples, spread <15s, acoustic snap found
+  MEDIUM — ≥2 matches and spread <30s, OR ≥3 matches without snap
+  LOW    — single hit, spread >30s, or no duration
 
 Usage:
     python experiments/shazam_detect.py \\
-        --audio episodes/fm95blo-2012-03-09-mp3.mp3 \\
-        --candidates data/candidates/fm95blo-2012-03-09.json \\
-        --features data/features/fm95blo-2012-03-09.json \\
+        --audio   episodes/fm95blo-2012-03-09-mp3.mp3 \\
+        --candidates data/candidates/fm95blo-2012-03-09_finalcuts.json \\
+        --features   data/features/fm95blo-2012-03-09.json \\
+        --transcript data/transcripts/fm95blo-2012-03-09.json \\
         --episode-name fm95blo-2012-03-09
 
-Outputs (all written to data/labels/):
-    song_matches_<name>.csv          -- full match + cut data
-    song_matches_<name>.json         -- same, machine-readable
+Outputs (all in data/labels/):
+    song_matches_<name>.csv
+    song_matches_<name>.json
     song_cut_suggestions_<name>_audacity.txt
-    song_unmatched_<name>.csv        -- regions with no Shazam match
-
-Install deps:
-    pip install shazamio
+    song_unmatched_<name>.csv
+    boundary_debug_<name>.json   ← new: per-song boundary debug report
 """
 
 import argparse
@@ -44,6 +36,7 @@ import asyncio
 import csv
 import json
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -59,28 +52,36 @@ except ImportError:
 
 # ── Tuning parameters ──────────────────────────────────────────────────────────
 
-CORE_TRIM_FRACTION = 0.20   # skip this fraction off each end of a region
-MAX_CORE_SECONDS   = 90.0   # cap the fingerprinted window
-MIN_CORE_SECONDS   = 8.0    # too short to recognise reliably
-RETRY_OFFSET_S     = 30.0   # if first attempt fails, shift the window by this much
+SAMPLE_CLIP_LEN      = 15.0   # seconds per Shazam clip
+SAMPLE_EDGE_SKIP     = 8.0    # skip from each region edge before sampling
+SAMPLE_INTERVAL      = 45.0   # target spacing between sample centres
+MAX_SAMPLES_PER_REG  = 6      # hard cap per region
 
-PRE_PADDING  = 3.0   # seconds of lead-in before estimated song start
-POST_PADDING = 5.0   # seconds of trail-out after estimated song end
+CLUSTER_AGREE_S      = 15.0   # spread below this → HIGH start confidence
+CLUSTER_WARN_S       = 30.0   # spread above this → UNCERTAIN
 
-# A cut is flagged "uncertain" when the estimated boundaries overshoot the
-# heuristic region by more than this (suggests wrong duration or wrong offset).
-BOUNDARY_SLACK         = 40.0   # how far outside the region we trust
-UNCERTAIN_OVERSHOOT    = 60.0   # beyond this → flag uncertain, clamp to region
+PRE_PADDING          = 3.0    # lead-in before estimated song start
+POST_PADDING         = 5.0    # trail-out after estimated song end
 
+BOUNDARY_SLACK       = 40.0   # how far outside region we still trust
+UNCERTAIN_OVERSHOOT  = 60.0   # beyond this → clamp and flag uncertain
+
+SNAP_RADIUS          = 30.0   # search ±Xs from estimated boundary
+SNAP_SMOOTH_WIN      = 7      # smooth signal window half-width (seconds each side)
+MUSIC_LO             = 0.30   # signal below this = clear speech
+
+END_SCAN_PROBES      = 4      # clips to probe past region end (n≥2 path)
+END_SCAN_PROBES_N1   = 10    # clips for single-hit forward sweep
+END_SCAN_STEP        = 30.0   # spacing between end-scan probes
 
 MB_USER_AGENT = "fm95blo-cutter/1.0 (bjarturpall@gmail.com)"
-MB_RATE_LIMIT  = 1.1   # seconds between MusicBrainz requests (their policy: 1/s)
+MB_RATE_LIMIT  = 1.1
 
 _mb_last_request: float = 0.0
-_duration_cache: dict[str, tuple[float | None, str]] = {}  # (artist,title) → (seconds, source)
+_duration_cache: dict[str, tuple[float | None, str]] = {}
 
 
-# ── Duration lookup ────────────────────────────────────────────────────────────
+# ── Duration lookup (unchanged) ────────────────────────────────────────────────
 
 def _itunes_duration(track_adam_id: str) -> float | None:
     if not track_adam_id:
@@ -108,7 +109,6 @@ def _mb_duration(artist: str, title: str) -> float | None:
         req = urllib.request.Request(url, headers={"User-Agent": MB_USER_AGENT})
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
-        # Take first recording with a length; prefer exact title match
         for rec in data.get("recordings", []):
             if rec.get("length"):
                 return rec["length"] / 1000.0
@@ -164,32 +164,27 @@ def _spotify_duration(artist: str, title: str) -> float | None:
 
 
 def lookup_duration(artist: str, title: str, track_adam_id: str) -> tuple[float | None, str]:
-    """Try each duration source in priority order. Returns (seconds, source_name)."""
     key = (artist.lower(), title.lower())
     if key in _duration_cache:
         cached_dur, cached_src = _duration_cache[key]
         return cached_dur, cached_src + " (cached)"
-
     dur = _itunes_duration(track_adam_id)
     if dur:
         _duration_cache[key] = (dur, "itunes")
         return dur, "itunes"
-
     dur = _mb_duration(artist, title)
     if dur:
         _duration_cache[key] = (dur, "musicbrainz")
         return dur, "musicbrainz"
-
     dur = _spotify_duration(artist, title)
     if dur:
         _duration_cache[key] = (dur, "spotify")
         return dur, "spotify"
-
     _duration_cache[key] = (None, "none")
     return None, "none"
 
 
-# ── Shazam recognition ─────────────────────────────────────────────────────────
+# ── Shazam clip (unchanged) ────────────────────────────────────────────────────
 
 def extract_wav(audio_path: Path, start: float, end: float, tmp_path: str) -> None:
     subprocess.run(
@@ -200,18 +195,7 @@ def extract_wav(audio_path: Path, start: float, end: float, tmp_path: str) -> No
     )
 
 
-def core_window(region: dict) -> tuple[float, float]:
-    start, end = region["start"], region["end"]
-    trim = (end - start) * CORE_TRIM_FRACTION
-    cs, ce = start + trim, end - trim
-    if ce - cs > MAX_CORE_SECONDS:
-        mid = (cs + ce) / 2
-        cs, ce = mid - MAX_CORE_SECONDS / 2, mid + MAX_CORE_SECONDS / 2
-    return cs, ce
-
-
 async def shazam_clip(audio_path: Path, start: float, end: float) -> dict | None:
-    """Extract [start, end) and run Shazam. Returns parsed track info or None."""
     shazam = Shazam()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp_path = tmp.name
@@ -220,164 +204,454 @@ async def shazam_clip(audio_path: Path, start: float, end: float) -> dict | None
         result = await shazam.recognize(tmp_path)
     finally:
         Path(tmp_path).unlink(missing_ok=True)
-
     matches = result.get("matches", [])
     track   = result.get("track")
     if not matches or not track:
         return None
-
     return {
-        "title":        track.get("title", ""),
-        "artist":       track.get("subtitle", ""),
-        "offset":       matches[0].get("offset", 0.0),
-        "trackadamid":  track.get("trackadamid") or "",
-        "isrc":         track.get("isrc") or "",
-        "key":          track.get("key", ""),
+        "title":       track.get("title", ""),
+        "artist":      track.get("subtitle", ""),
+        "offset":      matches[0].get("offset", 0.0),
+        "trackadamid": track.get("trackadamid") or "",
+        "isrc":        track.get("isrc") or "",
+        "key":         track.get("key", ""),
     }
 
 
-# ── Boundary logic ─────────────────────────────────────────────────────────────
+# ── Acoustic signal ────────────────────────────────────────────────────────────
 
-def compute_cut(region: dict, clip_start: float, match: dict,
-                duration: float | None, episode_duration: float) -> dict:
+def build_music_signal(
+    features_windows: list[dict],
+    transcript_segments: list[dict] | None,
+    episode_duration: float,
+) -> list[float]:
     """
-    Derive suggested cut boundaries from the Shazam offset + optional duration.
-
-    song_start = clip_start - shazam_offset
-    song_end   = song_start + duration (if known)
-
-    Sanity checks:
-    - If song_start is far before the heuristic region (>UNCERTAIN_OVERSHOOT),
-      clamp to region_start and flag uncertain -- suggests the song started
-      way earlier and we caught only the tail, or offset is wrong.
-    - If song_end is far past the heuristic region (>UNCERTAIN_OVERSHOOT),
-      clamp to region_end and flag uncertain -- suggests the duration is the
-      album version but the radio used an edit or faded early.
+    Per-second music likelihood signal.
+    Combines music_score (spectral) with rms_db (loudness) from features,
+    and no_speech_prob from transcript segments where available.
+    Returns list indexed by integer second.
     """
-    r_start = region["start"]
-    r_end   = region["end"]
+    n = int(episode_duration) + 2
+    signal = [0.0] * n
 
-    song_start = clip_start - match["offset"]
-    song_end   = (song_start + duration) if duration else None
+    # Normalise rms_db to [0,1]: typical range is -50 (silence) to -10 (loud)
+    for w in features_windows:
+        t = int(w["t"])
+        if not (0 <= t < n):
+            continue
+        ms  = w.get("music_score", 0.0)
+        rms = max(0.0, min(1.0, (w.get("rms_db", -50.0) + 50.0) / 40.0))
+        signal[t] = 0.4 * ms + 0.6 * rms
 
-    uncertain_reasons: list[str] = []
+    # Blend in no_speech_prob from transcript (high = non-speech = music/silence)
+    if transcript_segments:
+        for seg in transcript_segments:
+            nsp = seg.get("no_speech_prob", 0.5)
+            s_t = max(0, int(seg["start"]))
+            e_t = min(n, int(seg["end"]) + 1)
+            for t in range(s_t, e_t):
+                signal[t] = max(signal[t], nsp)
 
-    # ── suggested start ───────────────────────────────────────────────────────
-    raw_start = song_start - PRE_PADDING
-    if song_start < r_start - UNCERTAIN_OVERSHOOT:
-        uncertain_reasons.append(
-            f"song_start {song_start:.0f}s is {r_start - song_start:.0f}s before region"
-        )
-        cut_start = r_start  # be conservative
-    else:
-        cut_start = max(0.0, raw_start)
+    return signal
 
-    # ── suggested end ─────────────────────────────────────────────────────────
-    if song_end is not None:
-        raw_end = song_end + POST_PADDING
-        if song_end > r_end + UNCERTAIN_OVERSHOOT:
-            uncertain_reasons.append(
-                f"song_end {song_end:.0f}s is {song_end - r_end:.0f}s past region "
-                f"(radio edit / early fade?)"
-            )
-            cut_end = r_end + 5.0  # slight overshoot to catch fade
+
+def smooth_signal(signal: list[float], half_win: int = SNAP_SMOOTH_WIN) -> list[float]:
+    n = len(signal)
+    result = [0.0] * n
+    for t in range(n):
+        lo = max(0, t - half_win)
+        hi = min(n, t + half_win + 1)
+        result[t] = sum(signal[lo:hi]) / (hi - lo)
+    return result
+
+
+def snap_boundary(
+    smoothed: list[float],
+    approx_t: float,
+    direction: str,          # 'start' or 'end'
+    radius: float = SNAP_RADIUS,
+) -> tuple[float | None, str]:
+    """
+    Find the nearest music↔speech transition within ±radius of approx_t.
+    direction='start': look for signal rising through MUSIC_LO (speech→music).
+    direction='end':   look for signal falling through MUSIC_LO (music→speech).
+    Returns (snapped_time, note) or (None, reason).
+    """
+    t_lo = max(0, int(approx_t - radius))
+    t_hi = min(len(smoothed) - 2, int(approx_t + radius))
+
+    crossings = []
+    for t in range(t_lo, t_hi + 1):
+        v0 = smoothed[t]
+        v1 = smoothed[t + 1] if t + 1 < len(smoothed) else v0
+        if direction == "start" and v0 < MUSIC_LO <= v1:
+            crossings.append(t)
+        elif direction == "end" and v0 >= MUSIC_LO > v1:
+            crossings.append(t)
+
+    if not crossings:
+        return None, f"no {direction} acoustic transition found in ±{radius:.0f}s"
+
+    best = min(crossings, key=lambda c: abs(c - approx_t))
+    dist = abs(best - approx_t)
+    direction_word = "earlier" if best < approx_t else "later"
+    return float(best), f"{direction} snap {dist:.0f}s {direction_word} → {_hms(best)}"
+
+
+# ── Multi-sample sweep ─────────────────────────────────────────────────────────
+
+def sample_region_points(
+    r_start: float, r_end: float,
+    edge_skip: float = SAMPLE_EDGE_SKIP,
+    interval:  float = SAMPLE_INTERVAL,
+    clip_len:  float = SAMPLE_CLIP_LEN,
+    max_n:     int   = MAX_SAMPLES_PER_REG,
+) -> list[float]:
+    """Evenly spaced sample start times inside the region, skipping edges."""
+    s = r_start + edge_skip
+    e = r_end   - edge_skip - clip_len
+
+    if e <= s + 1:
+        # Too short for edge skipping: just try the centre
+        mid = (r_start + r_end) / 2.0 - clip_len / 2.0
+        return [round(max(r_start, min(mid, r_end - clip_len)), 1)]
+
+    span = e - s
+    n = max(2, min(max_n, int(span / interval) + 1))
+
+    if n == 1:
+        return [round(s + span / 2.0, 1)]
+
+    pts = [round(s + i * span / (n - 1), 1) for i in range(n)]
+    return pts
+
+
+def _song_key(match: dict) -> str:
+    k = match.get("key", "")
+    if k:
+        return k
+    return f"{match.get('artist','').lower()}|{match.get('title','').lower()}"
+
+
+def _pick_best_song(raw_matches: list[dict]) -> tuple[str, list[dict]]:
+    """Return (song_key, matches_for_that_song) for the most-matched song."""
+    counts: dict[str, int] = {}
+    by_key: dict[str, list] = {}
+    for m in raw_matches:
+        k = _song_key(m)
+        counts[k] = counts.get(k, 0) + 1
+        by_key.setdefault(k, []).append(m)
+    best_key = max(counts, key=lambda k: (counts[k], -by_key[k][0]["time"]))
+    return best_key, by_key[best_key]
+
+
+def _boundary_confidence(n: int, spread: float, start_snapped: bool, end_snapped: bool) -> str:
+    if n >= 3 and spread < CLUSTER_AGREE_S:
+        return "HIGH" if (start_snapped or end_snapped) else "MEDIUM"
+    if n >= 2 and spread < CLUSTER_WARN_S:
+        return "MEDIUM"
+    return "LOW"
+
+
+# ── End scan ───────────────────────────────────────────────────────────────────
+
+async def scan_end(
+    audio_path: Path,
+    song_key: str,
+    best_match: dict,
+    est_end: float,
+    episode_duration: float,
+    n_probes:  int   = END_SCAN_PROBES,
+    step:      float = END_SCAN_STEP,
+    clip_len:  float = SAMPLE_CLIP_LEN,
+) -> tuple[float | None, list[dict]]:
+    """
+    Probe clips starting one step before est_end and extending past it.
+    Returns (last_match_clip_start, probe_list).
+    """
+    probes = []
+    last_match_t: float | None = None
+    consec_misses = 0
+
+    probe_origin = max(0.0, est_end - step)
+
+    for i in range(n_probes + 1):
+        t = probe_origin + i * step
+        if t + clip_len > episode_duration:
+            break
+
+        match = await shazam_clip(audio_path, t, t + clip_len)
+        await asyncio.sleep(0.3)
+
+        if match and _song_key(match) == song_key:
+            last_match_t = t
+            consec_misses = 0
+            probes.append({"t": round(t, 1), "result": "match",
+                           "song": f"{match['artist']} - {match['title']}"})
         else:
-            cut_end = min(episode_duration, raw_end)
-    else:
-        # No duration: use the heuristic region boundary
-        cut_end = r_end
-        if duration is None:
-            uncertain_reasons.append("no duration found, using heuristic end")
+            consec_misses += 1
+            probes.append({"t": round(t, 1),
+                           "result": "no_match" if not match else "different_song",
+                           "song": f"{match['artist']} - {match['title']}" if match else None})
+            if consec_misses >= 2:
+                break
 
-    cut_end = min(cut_end, episode_duration)
+    return last_match_t, probes
 
+
+# ── Main region processor ──────────────────────────────────────────────────────
+
+def _no_match_result(region: dict) -> dict:
     return {
-        "song_start_in_episode": round(song_start, 1),
-        "song_end_in_episode":   round(song_end, 1) if song_end is not None else None,
-        "suggested_start":       round(cut_start, 1),
-        "suggested_end":         round(cut_end, 1),
-        "uncertain":             len(uncertain_reasons) > 0,
-        "uncertain_reasons":     uncertain_reasons,
+        **region,
+        "matched_song": None, "artist": None, "title": None,
+        "shazam_offset": None, "isrc": None,
+        "duration_s": None, "duration_source": "none",
+        "song_start_in_episode": None, "song_end_in_episode": None,
+        "suggested_start": region["start"], "suggested_end": region["end"],
+        "n_samples_total": 0, "n_samples_matched": 0, "start_spread_s": 0.0,
+        "boundary_confidence": "LOW",
+        "start_snap_note": "", "end_snap_note": "",
+        "cut_source": "heuristic_fallback",
+        "uncertain": True, "uncertain_reasons": ["no shazam match"],
+        "_debug": None,
     }
 
-
-# ── Main detection loop ────────────────────────────────────────────────────────
 
 async def process_region(
-    audio_path: Path, region: dict, episode_duration: float
+    audio_path: Path,
+    region: dict,
+    episode_duration: float,
+    smoothed: list[float],
 ) -> dict:
-    core_start, core_end = core_window(region)
-    core_dur = core_end - core_start
+    r_start, r_end = region["start"], region["end"]
 
-    match      = None
-    clip_start = core_start
+    # 1. Sample points
+    sample_pts = sample_region_points(r_start, r_end)
+    print(f"    {len(sample_pts)} samples: {[round(t) for t in sample_pts]}", file=sys.stderr)
 
-    if core_dur >= MIN_CORE_SECONDS:
-        match = await shazam_clip(audio_path, core_start, core_end)
+    # 2. Run Shazam on each sample
+    raw_matches: list[dict] = []
+    for i, t in enumerate(sample_pts):
+        clip_e = min(t + SAMPLE_CLIP_LEN, episode_duration)
+        if clip_e - t < 5.0:
+            continue
+        match = await shazam_clip(audio_path, t, clip_e)
+        if match:
+            label = f"{match['artist']} - {match['title']}"
+            est_s = round(t - match["offset"], 1)
+            print(f"    [{i+1}/{len(sample_pts)}] t={t:.0f}s MATCH: {label} "
+                  f"offset={match['offset']:.1f}s → est_start={_hms(est_s)}", file=sys.stderr)
+            raw_matches.append({"time": t, **match})
+        else:
+            print(f"    [{i+1}/{len(sample_pts)}] t={t:.0f}s no match", file=sys.stderr)
+        await asyncio.sleep(0.3)
 
-        # Retry at a different position if first attempt failed
-        if not match and core_dur > RETRY_OFFSET_S + MIN_CORE_SECONDS:
-            retry_s = core_start + RETRY_OFFSET_S
-            retry_e = min(core_end, retry_s + MAX_CORE_SECONDS)
-            if retry_e - retry_s >= MIN_CORE_SECONDS:
-                match = await shazam_clip(audio_path, retry_s, retry_e)
-                if match:
-                    clip_start = retry_s
+    if not raw_matches:
+        return _no_match_result(region)
 
-    if not match:
-        return {
-            **region,
-            "core_start": round(core_start, 1), "core_end": round(core_end, 1),
-            "matched_song": None, "artist": None, "title": None,
-            "shazam_offset": None, "isrc": None,
-            "duration_s": None, "duration_source": "none",
-            "song_start_in_episode": None, "song_end_in_episode": None,
-            "suggested_start": region["start"], "suggested_end": region["end"],
-            "cut_source": "heuristic_fallback",
-            "uncertain": True, "uncertain_reasons": ["no shazam match"],
-        }
+    # 3. Best song + cluster
+    song_key, song_matches = _pick_best_song(raw_matches)
+    n  = len(song_matches)
+    est_starts = [m["time"] - m["offset"] for m in song_matches]
+    median_start = statistics.median(est_starts)
+    spread = (max(est_starts) - min(est_starts)) if n > 1 else 0.0
 
-    song_label = f"{match['artist']} - {match['title']}"
-    print(f"    MATCH: {song_label} | offset={match['offset']:.1f}s", file=sys.stderr)
+    best = min(song_matches, key=lambda m: m["time"])
+    song_label = f"{best['artist']} - {best['title']}"
 
+    print(f"    → {song_label}: {n}/{len(sample_pts)} hits, "
+          f"spread={spread:.1f}s, median_start={_hms(median_start)}", file=sys.stderr)
+
+    # 4. Duration
     duration, dur_source = lookup_duration(
-        match["artist"], match["title"], match["trackadamid"]
+        best["artist"], best["title"], best.get("trackadamid", "")
     )
     if duration:
         print(f"    duration={duration:.1f}s via {dur_source}", file=sys.stderr)
-    else:
-        print(f"    no duration found (tried itunes/mb/spotify)", file=sys.stderr)
 
-    cut = compute_cut(region, clip_start, match, duration, episode_duration)
-    if cut["uncertain"]:
-        print(f"    UNCERTAIN: {'; '.join(cut['uncertain_reasons'])}", file=sys.stderr)
+    # 5. Acoustic start snap
+    snapped_start, start_note = snap_boundary(smoothed, median_start, "start")
+    final_start = snapped_start if snapped_start is not None else median_start
+    print(f"    start_snap: {start_note}", file=sys.stderr)
+
+    # 6. Estimate end: duration is reference; end scan finds the truth
+    est_end_from_dur     = (median_start + duration) if duration else None
+    last_sample_coverage = max(m["time"] for m in song_matches) + SAMPLE_CLIP_LEN
+
+    scan_last_t: float | None = None
+    end_scan_probes: list[dict] = []
+    end_scan_from_last_sample = False
+
+    if n >= 2 and est_end_from_dur is not None:
+        # Multi-hit: probe past the expected song end to confirm / find true end
+        print(f"    end scan: probing past {_hms(est_end_from_dur)}", file=sys.stderr)
+        scan_last_t, end_scan_probes = await scan_end(
+            audio_path, song_key, best, est_end_from_dur, episode_duration
+        )
+    elif n == 1:
+        # Single hit: DB duration is unverified. Sweep forward from last observed
+        # sample to find where the song actually stops, ignoring the DB duration.
+        end_scan_from_last_sample = True
+        print(f"    end scan (n=1): sweeping from {_hms(last_sample_coverage)}", file=sys.stderr)
+        scan_last_t, end_scan_probes = await scan_end(
+            audio_path, song_key, best, last_sample_coverage, episode_duration,
+            n_probes=END_SCAN_PROBES_N1,
+        )
+    if scan_last_t is not None:
+        print(f"    end scan: song still playing at t={scan_last_t:.0f}s", file=sys.stderr)
+
+    # Resolve final end
+    end_scan_ran    = len(end_scan_probes) > 0
+    end_scan_no_hit = end_scan_ran and scan_last_t is None
+
+    if scan_last_t is not None:
+        # End scan confirmed song: use last confirmed clip as floor
+        final_end_raw = scan_last_t + SAMPLE_CLIP_LEN
+    elif end_scan_no_hit and not end_scan_from_last_sample:
+        # n>=2 scan from est_end found nothing → DB duration is wrong version;
+        # fall back to last observed sample.
+        final_end_raw = last_sample_coverage
+    elif est_end_from_dur is not None:
+        # n=1 scan failed (unusual) or no scan ran: trust duration, floor at coverage
+        final_end_raw = max(est_end_from_dur, last_sample_coverage)
+    else:
+        final_end_raw = last_sample_coverage
+
+    # 7. Acoustic end snap
+    snapped_end, end_note = snap_boundary(smoothed, final_end_raw, "end")
+    final_end = snapped_end if snapped_end is not None else final_end_raw
+    print(f"    end_snap:   {end_note}", file=sys.stderr)
+
+    # 8. Uncertainty flags
+    uncertain_reasons: list[str] = []
+    if n == 1:
+        uncertain_reasons.append("single Shazam hit — boundary is an estimate only")
+    if end_scan_no_hit and not end_scan_from_last_sample and duration is not None:
+        uncertain_reasons.append(
+            f"end scan found no song past region — official duration ({duration:.0f}s) "
+            f"is likely wrong version; end clamped to last observed sample"
+        )
+    if end_scan_no_hit and end_scan_from_last_sample:
+        uncertain_reasons.append(
+            "n=1 end sweep found no song past last sample — end boundary unreliable"
+        )
+    if n > 1 and spread > CLUSTER_WARN_S:
+        uncertain_reasons.append(
+            f"estimated starts spread {spread:.0f}s across {n} samples (>{CLUSTER_WARN_S:.0f}s)"
+        )
+    # Clamp and flag if estimated boundaries are implausibly far outside the region
+    if final_start < r_start - UNCERTAIN_OVERSHOOT:
+        uncertain_reasons.append(
+            f"song_start {final_start:.0f}s is {r_start - final_start:.0f}s before region"
+        )
+        final_start = r_start
+    if final_end > r_end + UNCERTAIN_OVERSHOOT:
+        overshoot = final_end - r_end
+        if duration is not None:
+            # Have a duration: keep the estimate but flag it — radio edit / wrong version possible
+            uncertain_reasons.append(
+                f"song_end {final_end:.0f}s is {overshoot:.0f}s past region "
+                f"(using duration; check for radio edit / early fade)"
+            )
+        else:
+            # No duration at all: clamp conservatively
+            uncertain_reasons.append(
+                f"song_end {final_end:.0f}s is {overshoot:.0f}s past region (no duration; clamped)"
+            )
+            final_end = r_end + 5.0
+    # Backwards cut guard (offset > duration)
+    if final_end <= final_start:
+        uncertain_reasons.append(
+            f"reversed boundary (end {final_end:.0f}s ≤ start {final_start:.0f}s) — offset > duration?"
+        )
+        final_start = r_start
+        final_end   = r_end
+
+    # 9. Confidence and cut
+    confidence = _boundary_confidence(n, spread, snapped_start is not None, snapped_end is not None)
+    cut_start  = round(max(0.0, final_start - PRE_PADDING), 1)
+    cut_end    = round(min(episode_duration, final_end + POST_PADDING), 1)
+
+    # 10. Debug payload
+    debug = {
+        "song":                   song_label,
+        "region":                 [r_start, r_end],
+        "n_samples_total":        len(sample_pts),
+        "all_matches": [
+            {
+                "time":       round(m["time"], 1),
+                "offset":     round(m["offset"], 1),
+                "song":       f"{m['artist']} - {m['title']}",
+                "est_start":  round(m["time"] - m["offset"], 1),
+                "est_start_hms": _hms(m["time"] - m["offset"]),
+            }
+            for m in raw_matches
+        ],
+        "best_song_n_hits":       n,
+        "estimated_starts":       [round(s, 1) for s in est_starts],
+        "median_start":           round(median_start, 1),
+        "median_start_hms":       _hms(median_start),
+        "start_spread_s":         round(spread, 1),
+        "official_duration_s":    round(duration, 1) if duration else None,
+        "official_duration_src":  dur_source,
+        "last_sample_coverage_s": round(last_sample_coverage, 1),
+        "end_scan_probes":        end_scan_probes,
+        "est_end_from_duration":  round(est_end_from_dur, 1) if est_end_from_dur else None,
+        "scan_last_match_t":      round(scan_last_t, 1) if scan_last_t else None,
+        "final_end_raw":          round(final_end_raw, 1),
+        "start_snap_note":        start_note,
+        "end_snap_note":          end_note,
+        "final_start":            round(final_start, 1),
+        "final_end":              round(final_end, 1),
+        "cut_start":              cut_start,
+        "cut_end":                cut_end,
+        "boundary_confidence":    confidence,
+        "uncertain_reasons":      uncertain_reasons,
+    }
 
     return {
         **region,
-        "core_start":    round(core_start, 1),
-        "core_end":      round(core_end, 1),
-        "matched_song":  song_label,
-        "artist":        match["artist"],
-        "title":         match["title"],
-        "shazam_offset": round(match["offset"], 1),
-        "isrc":          match["isrc"],
-        "duration_s":    round(duration, 1) if duration else None,
-        "duration_source": dur_source,
-        "cut_source":    "shazam+" + dur_source if duration else "shazam_heuristic_end",
-        **cut,
+        "matched_song":          song_label,
+        "artist":                best["artist"],
+        "title":                 best["title"],
+        "shazam_offset":         round(best["offset"], 1),
+        "isrc":                  best.get("isrc", ""),
+        "duration_s":            round(duration, 1) if duration else None,
+        "duration_source":       dur_source,
+        "song_start_in_episode": round(final_start, 1),
+        "song_end_in_episode":   round(final_end, 1),
+        "suggested_start":       cut_start,
+        "suggested_end":         cut_end,
+        "n_samples_total":       len(sample_pts),
+        "n_samples_matched":     n,
+        "start_spread_s":        round(spread, 1),
+        "boundary_confidence":   confidence,
+        "start_snap_note":       start_note,
+        "end_snap_note":         end_note,
+        "cut_source":            f"multi_shazam_{n}_of_{len(sample_pts)}_samples",
+        "uncertain":             len(uncertain_reasons) > 0,
+        "uncertain_reasons":     uncertain_reasons,
+        "_debug":                debug,
     }
 
 
-async def run_all(audio_path: Path, candidates: list, episode_duration: float) -> list:
+# ── Orchestration ──────────────────────────────────────────────────────────────
+
+async def run_all(
+    audio_path: Path,
+    candidates: list,
+    episode_duration: float,
+    smoothed: list[float],
+) -> list:
     results = []
     for i, region in enumerate(candidates):
         print(
-            f"  [{i+1}/{len(candidates)}] {region['start']:.0f}–{region['end']:.0f}s ...",
+            f"\n  [{i+1}/{len(candidates)}] {region['start']:.0f}–{region['end']:.0f}s",
             file=sys.stderr,
         )
-        result = await process_region(audio_path, region, episode_duration)
+        result = await process_region(audio_path, region, episode_duration, smoothed)
         results.append(result)
-        await asyncio.sleep(0.5)   # polite to Shazam
     return results
 
 
@@ -385,15 +659,17 @@ async def run_all(audio_path: Path, candidates: list, episode_duration: float) -
 
 MATCH_FIELDS = [
     "index", "region_start", "region_end",
-    "matched_song", "shazam_offset", "duration_source", "duration_s",
+    "matched_song", "shazam_offset",
+    "n_samples_matched", "n_samples_total", "start_spread_s",
+    "boundary_confidence",
+    "duration_source", "duration_s",
     "song_start_in_episode", "song_end_in_episode",
     "suggested_start", "suggested_end", "suggested_start_hms", "suggested_end_hms",
+    "start_snap_note", "end_snap_note",
     "cut_source", "uncertain", "uncertain_reasons", "decision",
 ]
 
-UNMATCH_FIELDS = [
-    "index", "region_start", "region_end", "uncertain_reasons",
-]
+UNMATCH_FIELDS = ["index", "region_start", "region_end", "uncertain_reasons"]
 
 
 def _hms(s: float) -> str:
@@ -408,7 +684,7 @@ def write_outputs(results: list, out_dir: Path, episode_name: str) -> None:
     matched   = [r for r in results if r["matched_song"]]
     unmatched = [r for r in results if not r["matched_song"]]
 
-    # ── song_matches_<name>.csv ──────────────────────────────────────────────
+    # song_matches_<name>.csv
     matches_csv = out_dir / f"song_matches_{episode_name}.csv"
     with matches_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -417,87 +693,102 @@ def write_outputs(results: list, out_dir: Path, episode_name: str) -> None:
             decision = "review (uncertain)" if r["uncertain"] else "review (matched)"
             writer.writerow([
                 i, r["start"], r["end"],
-                r["matched_song"], r["shazam_offset"], r["duration_source"], r["duration_s"],
+                r["matched_song"], r["shazam_offset"],
+                r["n_samples_matched"], r["n_samples_total"], r["start_spread_s"],
+                r["boundary_confidence"],
+                r["duration_source"], r["duration_s"],
                 r["song_start_in_episode"], r["song_end_in_episode"],
                 r["suggested_start"], r["suggested_end"],
                 _hms(r["suggested_start"]), _hms(r["suggested_end"]),
+                r.get("start_snap_note", ""), r.get("end_snap_note", ""),
                 r["cut_source"], r["uncertain"],
                 "; ".join(r.get("uncertain_reasons", [])),
                 decision,
             ])
 
-    # ── song_matches_<name>.json ─────────────────────────────────────────────
+    # song_matches_<name>.json (strip _debug for cleaner JSON)
     matches_json = out_dir / f"song_matches_{episode_name}.json"
-    matches_json.write_text(
-        json.dumps(matched, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    clean = [{k: v for k, v in r.items() if k != "_debug"} for r in matched]
+    matches_json.write_text(json.dumps(clean, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # ── song_cut_suggestions_<name>_audacity.txt ─────────────────────────────
+    # boundary_debug_<name>.json
+    debug_json = out_dir / f"boundary_debug_{episode_name}.json"
+    debug_records = [r["_debug"] for r in results if r.get("_debug")]
+    debug_json.write_text(json.dumps(debug_records, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # Audacity cut suggestions (skip backwards)
     aud = out_dir / f"song_cut_suggestions_{episode_name}_audacity.txt"
     with aud.open("w", encoding="utf-8") as f:
         for r in results:
+            ss, se = r["suggested_start"], r["suggested_end"]
+            if se <= ss:
+                continue
             flag  = " [UNCERTAIN]" if r["uncertain"] else ""
             label = (r["matched_song"] or "unmatched") + flag
-            f.write(f"{r['suggested_start']:.3f}\t{r['suggested_end']:.3f}\t{label}\n")
+            f.write(f"{ss:.3f}\t{se:.3f}\t{label}\n")
 
-    # ── song_unmatched_<name>.csv ────────────────────────────────────────────
+    # song_unmatched_<name>.csv
     unmatch_csv = out_dir / f"song_unmatched_{episode_name}.csv"
     with unmatch_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(UNMATCH_FIELDS)
         for i, r in enumerate(unmatched):
-            writer.writerow([
-                i, r["start"], r["end"],
-                "; ".join(r.get("uncertain_reasons", [])),
-            ])
+            writer.writerow([i, r["start"], r["end"],
+                             "; ".join(r.get("uncertain_reasons", []))])
 
     print(f"\nOutputs written to {out_dir}/", file=sys.stderr)
-    print(f"  {matches_csv.name}", file=sys.stderr)
-    print(f"  {matches_json.name}", file=sys.stderr)
-    print(f"  {aud.name}", file=sys.stderr)
-    print(f"  {unmatch_csv.name}", file=sys.stderr)
+    for p in [matches_csv, matches_json, debug_json, aud, unmatch_csv]:
+        print(f"  {p.name}", file=sys.stderr)
 
 
 def print_summary_table(results: list, episode_name: str) -> None:
     matched = [r for r in results if r["matched_song"]]
-    print(f"\n{'─'*110}", file=sys.stderr)
+    sep = "─" * 120
+    print(f"\n{sep}", file=sys.stderr)
     print(f"  {episode_name}  —  {len(matched)}/{len(results)} matched", file=sys.stderr)
-    print(f"{'─'*110}", file=sys.stderr)
-    hdr = f"  {'Region':>15}  {'Song':<42}  {'Offset':>6}  {'Dur src':>11}  {'Dur':>6}  {'Cut start':>10}  {'Cut end':>10}  {'Note'}"
+    print(sep, file=sys.stderr)
+    hdr = (f"  {'Region':>15}  {'Song':<40}  {'Hits':>4}  {'Spread':>7}  "
+           f"{'Conf':<6}  {'Cut start':>10}  {'Cut end':>10}  Note")
     print(hdr, file=sys.stderr)
-    print(f"{'─'*110}", file=sys.stderr)
+    print(sep, file=sys.stderr)
     for r in results:
         region = f"{r['start']:.0f}–{r['end']:.0f}s"
-        song   = (r["matched_song"] or "(unmatched)")[:42]
-        offset = f"{r['shazam_offset']:.1f}s" if r["shazam_offset"] is not None else "—"
-        dsrc   = r["duration_source"] or "—"
-        dur    = f"{r['duration_s']:.0f}s" if r["duration_s"] else "—"
+        song   = (r["matched_song"] or "(unmatched)")[:40]
+        hits   = f"{r['n_samples_matched']}/{r['n_samples_total']}" if r["matched_song"] else "—"
+        spread = f"{r['start_spread_s']:.0f}s" if r.get("start_spread_s") else "—"
+        conf   = r.get("boundary_confidence", "—")
         cs     = _hms(r["suggested_start"])
         ce     = _hms(r["suggested_end"])
         note   = "UNCERTAIN" if r["uncertain"] else "ok"
-        print(f"  {region:>15}  {song:<42}  {offset:>6}  {dsrc:>11}  {dur:>6}  {cs:>10}  {ce:>10}  {note}", file=sys.stderr)
-    print(f"{'─'*110}\n", file=sys.stderr)
+        ss, se = r["suggested_start"], r["suggested_end"]
+        if r["matched_song"] and se <= ss:
+            note = "REVERSED (false match?)"
+        print(f"  {region:>15}  {song:<40}  {hits:>4}  {spread:>7}  "
+              f"{conf:<6}  {cs:>10}  {ce:>10}  {note}", file=sys.stderr)
+    print(f"{sep}\n", file=sys.stderr)
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--audio",          type=Path, required=True)
-    parser.add_argument("--candidates",     type=Path, required=True,
-                        help="data/candidates/<episode>.json from detect_breaks.py")
-    parser.add_argument("--features",       type=Path, default=None,
-                        help="data/features/<episode>.json (for episode duration)")
-    parser.add_argument("--episode-name",   required=True,
-                        help="short name used in output filenames, e.g. fm95blo-2011-11-09")
-    parser.add_argument("--out-dir",        type=Path, default=Path("data/labels"),
-                        help="directory for all output files (default: data/labels)")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--audio",        type=Path, required=True)
+    parser.add_argument("--candidates",   type=Path, required=True)
+    parser.add_argument("--features",     type=Path, default=None,
+                        help="data/features/<episode>.json — for acoustic signal + duration")
+    parser.add_argument("--transcript",   type=Path, default=None,
+                        help="data/transcripts/<episode>.json — for no_speech_prob signal")
+    parser.add_argument("--episode-name", required=True)
+    parser.add_argument("--out-dir",      type=Path, default=Path("data/labels"))
     args = parser.parse_args()
 
     candidates = json.loads(args.candidates.read_text(encoding="utf-8"))
 
     if args.features:
-        episode_duration = json.loads(args.features.read_text(encoding="utf-8"))["duration"]
+        feat_data = json.loads(args.features.read_text(encoding="utf-8"))
+        episode_duration  = feat_data["duration"]
+        features_windows  = feat_data.get("windows", [])
     else:
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -505,19 +796,32 @@ def main():
             capture_output=True, text=True, check=True,
         )
         episode_duration = float(probe.stdout.strip())
+        features_windows = []
+
+    transcript_segments: list[dict] = []
+    if args.transcript:
+        tr = json.loads(args.transcript.read_text(encoding="utf-8"))
+        transcript_segments = tr.get("segments", [])
+
+    print(f"Building acoustic signal ({len(features_windows)} feature windows, "
+          f"{len(transcript_segments)} transcript segments) ...", file=sys.stderr)
+    raw_signal = build_music_signal(features_windows, transcript_segments, episode_duration)
+    smoothed   = smooth_signal(raw_signal)
 
     print(f"Scanning {len(candidates)} candidate regions in {args.audio.name} ...", file=sys.stderr)
-    results = asyncio.run(run_all(args.audio, candidates, episode_duration))
+    results = asyncio.run(run_all(args.audio, candidates, episode_duration, smoothed))
 
     print_summary_table(results, args.episode_name)
     write_outputs(results, args.out_dir, args.episode_name)
 
     n_matched   = sum(1 for r in results if r["matched_song"])
-    n_with_dur  = sum(1 for r in results if r["duration_s"])
     n_uncertain = sum(1 for r in results if r["uncertain"])
+    n_high = sum(1 for r in results if r.get("boundary_confidence") == "HIGH")
+    n_med  = sum(1 for r in results if r.get("boundary_confidence") == "MEDIUM")
+    n_low  = sum(1 for r in results if r.get("boundary_confidence") == "LOW")
     print(
-        f"{len(results)} regions  |  {n_matched} matched  |  "
-        f"{n_with_dur} with duration  |  {n_uncertain} uncertain",
+        f"{len(results)} regions  |  {n_matched} matched  |  {n_uncertain} uncertain  |  "
+        f"confidence: {n_high} HIGH / {n_med} MEDIUM / {n_low} LOW",
         file=sys.stderr,
     )
 

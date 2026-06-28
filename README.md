@@ -54,36 +54,45 @@ python review_export.py \
     --out-csv data/labels/episode1_review.csv \
     --out-audacity data/labels/episode1_audacity.txt
 
-# 6b. (Optional) Run Shazam on heuristic candidate regions to identify songs
-#     and refine cut boundaries
+# 6b. Run Shazam on heuristic candidate regions to identify songs and refine
+#     cut boundaries using multi-sample clustering (2–6 clips per region)
 python experiments/shazam_detect.py \
-    --audio data/raw/episode1.mp3 \
+    --audio      episodes/episode1.mp3 \
     --candidates data/candidates/episode1_finalcuts.json \
+    --features   data/features/episode1.json \
+    --transcript data/transcripts/episode1.json \
     --episode-name episode1
 
-# 6c. (Optional) Run Shazam gap-scan to find music the heuristic missed
-#     entirely -- scans large gaps between finalcut candidates at 45s intervals
+# 6c. Run Shazam gap-scan to find music the heuristic missed entirely --
+#     scans large gaps between finalcut candidates at 45s intervals
 python experiments/shazam_gap_scan.py \
-    --audio data/raw/episode1.mp3 \
+    --audio      episodes/episode1.mp3 \
     --candidates data/candidates/episode1_finalcuts.json \
     --episode-name episode1
 
 # 6d. Build the combined review package (merges heuristic + both Shazam passes)
+#     and automatically generates hybrid classification outputs.
 python experiments/make_review.py \
     --heuristic-csv    data/labels/episode1_review.csv \
     --shazam-json      data/labels/song_matches_episode1.json \
     --shazam-unmatched data/labels/song_unmatched_episode1.csv \
     --gap-shazam-json  data/labels/gap_shazam_matches_episode1.json \
     --episode-name     episode1
-# → data/labels/review_sheet_episode1.csv   (open in Numbers/Excel)
-# → data/labels/review_audacity_episode1.txt (import into Audacity)
+# → data/labels/review_sheet_episode1.csv          (full annotated sheet)
+# → data/labels/hybrid_auto_cuts_episode1.csv      (safe to cut — no review needed)
+# → data/labels/hybrid_manual_review_episode1.csv  (needs human review)
+# → data/labels/hybrid_review_audacity_episode1.txt (import into Audacity)
 
-# 7. Review: import review_audacity_*.txt into Audacity. Label types:
-#      [H ...]               heuristic pipeline candidate
-#      [S ✓/⚠ ...]          Shazam-matched song (boundaries ok / uncertain)
-#      [GAP-SHAZAM ✓/⚠ ...] gap-scan match (song heuristic missed entirely)
-#    Fill in actual_start / actual_end / label / notes in review_sheet_*.csv.
-#    All gap-shazam matches are review-only -- do not auto-cut from them yet.
+# 7. Review: import hybrid_review_audacity_*.txt into Audacity. Label types:
+#      [AUTO ✓]     safe to cut automatically (Shazam-verified, ≥2 hits, ≥60s)
+#      [REVIEW-S ⚠] Shazam matched, boundary uncertain -- check in Audacity
+#      [REVIEW-B ⟳] Song real, but start is well before heuristic -- verify start
+#      [REVIEW-H ?] Heuristic-only candidate -- unknown song (Icelandic/ads?)
+#      [EXT →]      Gap-scan: suggested longer end for an existing cut
+#      [DROP? ✗]    Short or weak -- likely jingle or false positive
+#    Cut the [AUTO] rows from hybrid_auto_cuts_*.csv without review.
+#    Review hybrid_manual_review_*.csv for the rest; fill in actual_start /
+#    actual_end / notes.
 
 # 8. Cut and export the cleaned episode
 python export.py \
@@ -110,24 +119,47 @@ python export.py \
   stage-2 output -- that's the list you should actually be reviewing/cutting
   from.
 
-### Shazam detection layer (experimental, `experiments/`)
+### Shazam + hybrid review layer (`experiments/`)
 
-Two optional Shazam passes run on top of the heuristic pipeline and are
-combined into the review package via `make_review.py`:
+The heuristic pipeline (steps 1–6 above) is **unchanged**. The Shazam +
+hybrid steps run on top of it and produce the recommended review outputs.
+Running only steps 1–6 still works as before.
 
-- **`shazam_detect.py`** -- runs Shazam on heuristic candidate regions to
-  identify songs and compute precise cut boundaries from offset + duration.
+Three scripts identify songs, refine boundaries, and classify cuts:
+
+- **`shazam_detect.py`** -- multi-sample Shazam on heuristic candidate
+  regions. Sweeps 2–6 clips per region, clusters offset estimates, and
+  probes empirically for the true song end. Outputs
+  `song_matches_<ep>.json` and `boundary_debug_<ep>.json`.
 - **`shazam_gap_scan.py`** -- scans large gaps (default ≥3 min) between
-  finalcut candidates at 45s intervals with 15s clips. Finds songs the
-  heuristic never produced a candidate for at all. Validated on two episodes:
-  found Pitbull "Give Me Everything" (GT08, 2012) and Florence + the Machine
-  "Shake It Out" + Daughtry "Crawling Back to You" (two missed breaks, 2011).
-  Zero false positives in genuinely silent gaps across both runs.
+  finalcut candidates at 45s intervals. Finds songs the heuristic missed.
+  Validated on two episodes: zero false positives in genuinely silent gaps.
+- **`make_review.py`** -- merges heuristic + both Shazam passes into a
+  unified review sheet, then automatically calls `hybrid_review.py`.
+- **`hybrid_review.py`** -- classifies each row into one of five categories
+  (see step 7 above) and writes the ready-to-use output files.
 
-All Shazam and gap-scan matches are **review-only** -- `make_review.py`
-includes them in the Audacity label file and review CSV as suggestions, but
-they are never auto-cut. Do not raise confidence or auto-remove thresholds
-based on Shazam results until more episodes are labeled.
+**Cross-episode validation (2 labeled episodes, 2011 and 2012):**
+
+| | fm95blo-2011-11-09 | fm95blo-2012-02-28 | Combined |
+|---|---|---|---|
+| AUTO cuts | 5 | 6 | **11** |
+| AUTO precision | 100% | 100% | **100%** |
+| AUTO recall | 38% (5/13) | 55% (6/11) | — |
+| Auto-cuttable duration | 18.5 min | 21.1 min | **39.6 min** |
+| False positives | 0 | 0 | **0** |
+
+**Safety rules in `hybrid_review.py`:**
+- Requires ≥2 Shazam hits (`AUTO_MIN_HITS = 2`)
+- Requires ≥60s cut duration (`AUTO_MIN_DURATION = 60.0`)
+- If Shazam start is >30s before the heuristic region start → `[REVIEW-B]`
+  instead of `[AUTO]` (song may be playing under host talk or ads)
+- Single-hit matches → `[REVIEW-S]` regardless of other criteria
+
+The lower recall on the 2011 episode (38% vs 55%) is expected: that
+episode has more Icelandic music (not in Shazam's database) and more
+UNCERTAIN boundary estimates. All missed GT cuts appear in REVIEW
+categories and are caught during manual review.
 
 ## Calibrating against your labeled example episode
 

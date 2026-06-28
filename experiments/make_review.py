@@ -4,9 +4,14 @@ Generate a human-review package for one episode.
 Three detection sources are combined into a single Audacity label file
 and a unified review CSV:
 
-  [H]                — heuristic finalcuts pipeline
-  [S ✓/⚠]           — Shazam recognition on heuristic candidate regions
-  [GAP-SHAZAM ✓/⚠]  — Shazam gap-scan (songs in gaps the heuristic missed)
+  [H conf=X.X]       — heuristic finalcuts pipeline
+  [S ✓/⚠] Song       — Shazam recognition on heuristic candidate regions
+  [EXT ✓/⚠] Song     — gap-scan match that is a tail of an existing candidate
+                         (song started before the gap, boundary ended too early)
+  [GAP ✓/⚠] Song     — gap-scan match that is entirely new (heuristic missed it)
+
+EXT vs GAP classification: if song_start_in_episode < gap_start → EXT (tail);
+otherwise → GAP (new find).
 
 Merging rules (in order):
   1. Start from heuristic finalcuts as the primary list.
@@ -40,12 +45,17 @@ Usage:
 import argparse
 import csv
 import json
+import re
+import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
 
 # Minimum overlap (seconds) to associate a gap-shazam match with an existing row
 GAP_MERGE_OVERLAP = 30.0
+# Maximum gap between same-song regions to consider merging them
+SAME_SONG_MAX_GAP = 120.0
 
 
 def hms(s: float) -> str:
@@ -56,6 +66,209 @@ def hms(s: float) -> str:
 
 def overlap_s(a0: float, a1: float, b0: float, b1: float) -> float:
     return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def _song_name(row: dict) -> str:
+    return (row.get("matched_song") or "").lower().strip()
+
+
+def merge_same_song_rows(rows: list[dict], max_gap_s: float = SAME_SONG_MAX_GAP) -> list[dict]:
+    """
+    Merge adjacent rows that Shazam identified as the same song.
+    Requires: same matched_song, gap between suggested_end of row-i and
+    suggested_start of row-j ≤ max_gap_s.
+
+    The merged row keeps the earliest start and latest end, combines
+    heuristic regions, and adds a merge_note.
+    """
+    if not rows:
+        return rows
+
+    sorted_rows = sorted(
+        rows,
+        key=lambda r: float(r["suggested_start"]) if r["suggested_start"] != "" else 0.0,
+    )
+
+    result: list[dict] = []
+    skip: set[int] = set()
+
+    for i, r1 in enumerate(sorted_rows):
+        if i in skip:
+            continue
+
+        merged = {**r1, "merge_note": ""}
+        song1  = _song_name(r1)
+
+        if not song1:
+            result.append(merged)
+            continue
+
+        partners: list[int] = []
+        merged_end = float(merged["suggested_end"]) if merged["suggested_end"] != "" else 0.0
+
+        for j in range(i + 1, len(sorted_rows)):
+            if j in skip:
+                continue
+            r2 = sorted_rows[j]
+            if _song_name(r2) != song1:
+                continue
+
+            r2_start = float(r2["suggested_start"]) if r2["suggested_start"] != "" else 0.0
+            gap = r2_start - merged_end
+            if gap > max_gap_s:
+                continue
+
+            # Same song within gap threshold — merge
+            partners.append(j)
+            skip.add(j)
+
+            r1_h_start = float(merged["heuristic_start"]) if merged.get("heuristic_start") else float(merged["suggested_start"])
+            r2_h_start = float(r2.get("heuristic_start") or r2["suggested_start"])
+            r1_h_end   = float(merged["heuristic_end"])   if merged.get("heuristic_end")   else float(merged["suggested_end"])
+            r2_h_end   = float(r2.get("heuristic_end") or r2["suggested_end"])
+
+            merged["suggested_start"] = str(min(float(merged["suggested_start"]), float(r2["suggested_start"])))
+            merged["suggested_end"]   = str(max(float(merged["suggested_end"]),   float(r2["suggested_end"])))
+            merged["heuristic_start"] = str(min(r1_h_start, r2_h_start))
+            merged["heuristic_end"]   = str(max(r1_h_end,   r2_h_end))
+            merged["region_type"]     = "merged_same_song"
+
+            # Escalate uncertainty if either is uncertain
+            if r2.get("shazam_status") == "UNCERTAIN":
+                merged["shazam_status"] = "UNCERTAIN"
+            extra_reasons = r2.get("uncertain_reasons", "")
+            if extra_reasons:
+                existing = merged.get("uncertain_reasons", "")
+                merged["uncertain_reasons"] = (existing + "; " + extra_reasons).strip("; ")
+            # Aggregate hits; take best confidence (HIGH > MEDIUM > LOW)
+            conf_rank = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "": 0}
+            c1 = merged.get("boundary_confidence", "") or ""
+            c2 = r2.get("boundary_confidence", "") or ""
+            merged["boundary_confidence"] = c1 if conf_rank.get(c1, 0) >= conf_rank.get(c2, 0) else c2
+            try:
+                merged["n_samples_matched"] = int(float(merged.get("n_samples_matched") or 0)) + int(float(r2.get("n_samples_matched") or 0))
+            except (TypeError, ValueError):
+                pass
+
+            merged_end = float(merged["suggested_end"])
+
+        if partners:
+            gap_between = float(sorted_rows[partners[0]]["suggested_start"]) - float(r1["suggested_end"])
+            merged["merge_note"] = (
+                f"merged {1 + len(partners)} adjacent same-song regions "
+                f"(gap {gap_between:.0f}s — possible DJ talk)"
+            )
+
+        result.append(merged)
+
+    return result
+
+
+def evaluate_against_gt(
+    rows: list[dict],
+    gt_file: Path,
+    heuristic: list[dict],
+) -> None:
+    """Compare suggested cuts against known ground-truth cuts."""
+
+    def _to_s(t: str) -> float:
+        parts = t.strip().split(":")
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        return int(parts[0]) * 60 + float(parts[1])
+
+    gt: list[dict] = []
+    with gt_file.open(encoding="utf-8") as f:
+        raw = f.read()
+
+    # Format A: "music - MM:SS - MM:SS" (one per line)
+    if "music - " in raw:
+        for line in raw.splitlines():
+            m = re.match(r"music - (.+?) - (.+)", line.strip())
+            if m:
+                gt.append({"start": _to_s(m.group(1)), "end": _to_s(m.group(2))})
+    # Format B: CSV with header "start,end,label"
+    else:
+        import csv as _csv
+        for row in _csv.DictReader(raw.splitlines()):
+            lbl = (row.get("label") or "").strip()
+            if lbl in ("music", "music/ads"):
+                try:
+                    gt.append({"start": _to_s(row["start"]), "end": _to_s(row["end"])})
+                except (KeyError, ValueError):
+                    pass
+
+    if not gt:
+        print("  (no GT cuts parsed — check file format)")
+        return
+
+    suggested = [
+        {
+            "start": float(r["suggested_start"]),
+            "end":   float(r["suggested_end"]),
+            "song":  r.get("matched_song", "") or "",
+            "type":  r.get("region_type", ""),
+        }
+        for r in rows
+        if r.get("suggested_start") not in ("", None)
+    ]
+
+    print(f"\n{'='*88}")
+    print(f"Ground-truth evaluation: {gt_file.name}")
+    print(f"{'='*88}")
+    print(
+        f"  {'#':>2}  {'GT start':>8} {'GT end':>6} {'dur':>4}   "
+        f"{'S start':>8} {'S end':>6} {'dur':>4}   {'Δstart':>7} {'Δend':>7}  Song / Note"
+    )
+    print(f"  {'─'*86}")
+
+    total_se = total_ee = n_matched = 0
+
+    for gi, g in enumerate(gt):
+        gdur = g["end"] - g["start"]
+
+        best, best_ov = None, 0.0
+        for s in suggested:
+            ov = overlap_s(g["start"], g["end"], s["start"], s["end"])
+            if ov > best_ov:
+                best_ov, best = ov, s
+
+        gs = hms(g["start"])
+        ge = hms(g["end"])
+
+        if best and best_ov >= 30.0:
+            ds   = best["start"] - g["start"]
+            de   = best["end"]   - g["end"]
+            sdur = best["end"]   - best["start"]
+            flag = " ⚠" if abs(ds) > 30 or abs(de) > 30 else "  "
+            song = (best["song"] or best["type"])[:36]
+            print(
+                f"  {gi+1:>2}  {gs:>8} {ge:>6} {gdur:>4.0f}s  "
+                f"{hms(best['start']):>8} {hms(best['end']):>6} {sdur:>4.0f}s  "
+                f"{ds:>+7.0f}s {de:>+7.0f}s  {song}{flag}"
+            )
+            total_se += abs(ds)
+            total_ee += abs(de)
+            n_matched += 1
+        else:
+            # Shazam missed it — check heuristic fallback
+            h_note = ""
+            for h in heuristic:
+                if overlap_s(g["start"], g["end"], h["start"], h["end"]) >= 30.0:
+                    h_note = f"[H conf={h['confidence']:.1f}] {hms(h['start'])}–{hms(h['end'])} — Shazam unmatched (Icelandic?)"
+                    break
+            if not h_note:
+                h_note = "BLIND SPOT — not detected by heuristic or Shazam"
+            print(
+                f"  {gi+1:>2}  {gs:>8} {ge:>6} {gdur:>4.0f}s  "
+                f"  {'—':>8} {'—':>6} {'—':>4}  {'':>7}  {'':>7}  {h_note}"
+            )
+
+    print(f"\n  Matched {n_matched}/{len(gt)} GT cuts")
+    if n_matched:
+        print(f"  Mean |Δstart| = {total_se/n_matched:.0f}s")
+        print(f"  Mean |Δend|   = {total_ee/n_matched:.0f}s")
+    print(f"{'='*88}\n")
 
 
 def main() -> None:
@@ -74,6 +287,10 @@ def main() -> None:
     parser.add_argument("--episode-name",       required=True,
                         help="short name used in output filenames")
     parser.add_argument("--out-dir",            type=Path, default=Path("data/labels"))
+    parser.add_argument("--gt-file",            type=Path, default=None,
+                        help="ground-truth cut file (format: 'music - MM:SS - MM:SS')")
+    parser.add_argument("--same-song-max-gap",  type=float, default=SAME_SONG_MAX_GAP,
+                        help="max gap (s) between adjacent same-song regions to merge (default 120)")
     args = parser.parse_args()
 
     # ── Load all sources ──────────────────────────────────────────────────────
@@ -125,18 +342,20 @@ def main() -> None:
             used_shazam.add(best_sm_i)
             sm_status = "UNCERTAIN" if sm["uncertain"] else "ok"
             rows.append({
-                "region_type":       "heuristic+shazam",
-                "heuristic_start":   h["start"],
-                "heuristic_end":     h["end"],
-                "heuristic_conf":    h["confidence"],
-                "matched_song":      sm.get("matched_song", ""),
-                "shazam_offset":     sm.get("shazam_offset", ""),
-                "duration_s":        sm.get("duration_s", ""),
-                "duration_source":   sm.get("duration_source", ""),
-                "shazam_status":     sm_status,
-                "uncertain_reasons": "; ".join(sm.get("uncertain_reasons", [])),
-                "suggested_start":   sm["suggested_start"] if not sm["uncertain"] else h["start"],
-                "suggested_end":     sm["suggested_end"]   if not sm["uncertain"] else h["end"],
+                "region_type":          "heuristic+shazam",
+                "heuristic_start":      h["start"],
+                "heuristic_end":        h["end"],
+                "heuristic_conf":       h["confidence"],
+                "matched_song":         sm.get("matched_song", ""),
+                "shazam_offset":        sm.get("shazam_offset", ""),
+                "duration_s":           sm.get("duration_s", ""),
+                "duration_source":      sm.get("duration_source", ""),
+                "shazam_status":        sm_status,
+                "uncertain_reasons":    "; ".join(sm.get("uncertain_reasons", [])),
+                "n_samples_matched":    sm.get("n_samples_matched", ""),
+                "boundary_confidence":  sm.get("boundary_confidence", ""),
+                "suggested_start":      sm["suggested_start"],
+                "suggested_end":        sm["suggested_end"],
             })
         else:
             rows.append({
@@ -160,18 +379,20 @@ def main() -> None:
             continue
         sm_status = "UNCERTAIN" if sm["uncertain"] else "ok"
         rows.append({
-            "region_type":       "shazam_only",
-            "heuristic_start":   "",
-            "heuristic_end":     "",
-            "heuristic_conf":    "",
-            "matched_song":      sm.get("matched_song", ""),
-            "shazam_offset":     sm.get("shazam_offset", ""),
-            "duration_s":        sm.get("duration_s", ""),
-            "duration_source":   sm.get("duration_source", ""),
-            "shazam_status":     sm_status,
-            "uncertain_reasons": "; ".join(sm.get("uncertain_reasons", [])),
-            "suggested_start":   sm["suggested_start"],
-            "suggested_end":     sm["suggested_end"],
+            "region_type":         "shazam_only",
+            "heuristic_start":     "",
+            "heuristic_end":       "",
+            "heuristic_conf":      "",
+            "matched_song":        sm.get("matched_song", ""),
+            "shazam_offset":       sm.get("shazam_offset", ""),
+            "duration_s":          sm.get("duration_s", ""),
+            "duration_source":     sm.get("duration_source", ""),
+            "shazam_status":       sm_status,
+            "uncertain_reasons":   "; ".join(sm.get("uncertain_reasons", [])),
+            "n_samples_matched":   sm.get("n_samples_matched", ""),
+            "boundary_confidence": sm.get("boundary_confidence", ""),
+            "suggested_start":     sm["suggested_start"],
+            "suggested_end":       sm["suggested_end"],
         })
 
     # ── Stage 2: annotate rows with gap-shazam matches ────────────────────────
@@ -181,6 +402,7 @@ def main() -> None:
         row.setdefault("gap_shazam_start",             "")
         row.setdefault("gap_shazam_end",               "")
         row.setdefault("gap_shazam_status",            "")
+        row.setdefault("gap_shazam_type",              "")
         row.setdefault("gap_shazam_uncertain_reasons", "")
 
     used_gs: set[int] = set()
@@ -201,10 +423,12 @@ def main() -> None:
         if best_gs_i is not None and best_gs_ov >= GAP_MERGE_OVERLAP:
             gs = gap_shazam[best_gs_i]
             used_gs.add(best_gs_i)
+            gs_type = "extension" if gs.get("song_start_in_episode", gs["gap_start"]) < gs["gap_start"] else "new_gap_find"
             row["gap_shazam_song"]              = gs["matched_song"]
             row["gap_shazam_start"]             = gs["suggested_start"]
             row["gap_shazam_end"]               = gs["suggested_end"]
             row["gap_shazam_status"]            = "UNCERTAIN" if gs["uncertain"] else "ok"
+            row["gap_shazam_type"]              = gs_type
             row["gap_shazam_uncertain_reasons"] = "; ".join(gs.get("uncertain_reasons", []))
             row["region_type"]                  = row["region_type"] + "+gap_shazam"
 
@@ -212,6 +436,7 @@ def main() -> None:
     for i, gs in enumerate(gap_shazam):
         if i in used_gs:
             continue
+        gs_type = "extension" if gs.get("song_start_in_episode", gs["gap_start"]) < gs["gap_start"] else "new_gap_find"
         rows.append({
             "region_type":                 "gap_shazam_only",
             "heuristic_start":             "",
@@ -229,12 +454,26 @@ def main() -> None:
             "gap_shazam_start":            gs["suggested_start"],
             "gap_shazam_end":              gs["suggested_end"],
             "gap_shazam_status":           "UNCERTAIN" if gs["uncertain"] else "ok",
+            "gap_shazam_type":             gs_type,
             "gap_shazam_uncertain_reasons": "; ".join(gs.get("uncertain_reasons", [])),
         })
 
     rows.sort(key=lambda r: (
         float(r["suggested_start"]) if r["suggested_start"] != "" else 0.0
     ))
+
+    # ── Stage 3: merge adjacent rows with the same Shazam song ───────────────
+    before_merge = len(rows)
+    rows = merge_same_song_rows(rows, max_gap_s=args.same_song_max_gap)
+    n_merged = before_merge - len(rows)
+    if n_merged:
+        print(f"\nSame-song merge: {n_merged} row(s) absorbed into adjacent same-song rows")
+        for r in rows:
+            if r.get("region_type") == "merged_same_song":
+                ss = float(r["suggested_start"])
+                se = float(r["suggested_end"])
+                print(f"  merged → {r['matched_song'][:45]}  {hms(ss)}–{hms(se)}"
+                      f"  [{r.get('merge_note','')}]")
 
     # ── Write review sheet CSV ────────────────────────────────────────────────
 
@@ -248,11 +487,14 @@ def main() -> None:
         # Normal Shazam columns
         "matched_song", "shazam_status", "uncertain_reasons",
         "shazam_offset_s", "duration_s", "duration_source",
+        "n_samples_matched", "boundary_confidence",
         # Heuristic columns
         "heuristic_start", "heuristic_end", "heuristic_conf",
         # Gap-shazam columns
         "gap_shazam_song", "gap_shazam_start", "gap_shazam_end",
-        "gap_shazam_status", "gap_shazam_uncertain_reasons",
+        "gap_shazam_status", "gap_shazam_type", "gap_shazam_uncertain_reasons",
+        # Merge info
+        "merge_note",
         # Fill these in during review
         "actual_start", "actual_end",
         "actual_start_hms", "actual_end_hms",
@@ -278,6 +520,8 @@ def main() -> None:
                 "shazam_offset_s":             r.get("shazam_offset", ""),
                 "duration_s":                  r.get("duration_s", ""),
                 "duration_source":             r.get("duration_source", ""),
+                "n_samples_matched":           r.get("n_samples_matched", ""),
+                "boundary_confidence":         r.get("boundary_confidence", ""),
                 "heuristic_start":             r.get("heuristic_start", ""),
                 "heuristic_end":               r.get("heuristic_end", ""),
                 "heuristic_conf":              r.get("heuristic_conf", ""),
@@ -285,7 +529,9 @@ def main() -> None:
                 "gap_shazam_start":            r.get("gap_shazam_start", ""),
                 "gap_shazam_end":              r.get("gap_shazam_end", ""),
                 "gap_shazam_status":           r.get("gap_shazam_status", ""),
+                "gap_shazam_type":             r.get("gap_shazam_type", ""),
                 "gap_shazam_uncertain_reasons": r.get("gap_shazam_uncertain_reasons", ""),
+                "merge_note":          r.get("merge_note", ""),
                 "actual_start":    "", "actual_end":     "",
                 "actual_start_hms":"","actual_end_hms": "",
                 "label": "", "notes": "",
@@ -300,17 +546,20 @@ def main() -> None:
         lines.append((h["start"], h["end"], f"[H conf={h['confidence']:.1f}]"))
 
     for sm in shazam_matched:
-        flag  = " ⚠" if sm["uncertain"] else " ✓"
-        lines.append((
-            sm["suggested_start"], sm["suggested_end"],
-            f"[S{flag}] {sm.get('matched_song', '')}",
-        ))
+        # Skip impossible matches (offset > song duration → reversed boundaries)
+        ss, se = sm["suggested_start"], sm["suggested_end"]
+        if se <= ss:
+            continue
+        flag = " ⚠" if sm["uncertain"] else " ✓"
+        lines.append((ss, se, f"[S{flag}] {sm.get('matched_song', '')}",))
 
     for gs in gap_shazam:
-        flag  = " ⚠" if gs["uncertain"] else " ✓"
+        flag = " ⚠" if gs["uncertain"] else " ✓"
+        is_ext = gs.get("song_start_in_episode", gs["gap_start"]) < gs["gap_start"]
+        prefix = "EXT" if is_ext else "GAP"
         lines.append((
             gs["suggested_start"], gs["suggested_end"],
-            f"[GAP-SHAZAM{flag}] {gs.get('matched_song', '')}",
+            f"[{prefix}{flag}] {gs.get('matched_song', '')}",
         ))
 
     lines.sort(key=lambda x: x[0])
@@ -340,13 +589,20 @@ def main() -> None:
     print(f"  {review_csv}")
     print(f"  {aud}")
 
+    if args.gt_file and args.gt_file.exists():
+        evaluate_against_gt(rows, args.gt_file, heuristic)
+
     print(f"""
 Label guide for Audacity:
-  [H ...]                = heuristic pipeline candidate
-  [S ✓ ...]             = Shazam-matched (boundaries ok)
-  [S ⚠ ...]             = Shazam-matched (boundary uncertain)
-  [GAP-SHAZAM ✓ ...]    = gap-scan match (ok)
-  [GAP-SHAZAM ⚠ ...]    = gap-scan match (uncertain)
+  [H conf=X.X]          = heuristic pipeline candidate
+  [S ✓] Song            = Shazam-matched (boundaries ok)
+  [S ⚠] Song            = Shazam-matched (boundary uncertain)
+  [EXT ✓/⚠] Song        = gap-scan: song tail extending past heuristic boundary
+  [GAP ✓/⚠] Song        = gap-scan: entirely missed song inside a gap
+
+gap_shazam_type in CSV:
+  extension     — song started before gap; heuristic cut off too early
+  new_gap_find  — song started inside gap; heuristic missed it entirely
 
 region_type in CSV:
   heuristic_only              — pipeline only, no Shazam
@@ -355,6 +611,16 @@ region_type in CSV:
   gap_shazam_only             — gap scan only (review carefully — new find)
   *+gap_shazam                — gap scan corroborates/extends an existing row
 """)
+
+    # ── Auto-run hybrid classification ────────────────────────────────────────
+    hybrid_script = Path(__file__).parent / "hybrid_review.py"
+    subprocess.run(
+        [sys.executable, str(hybrid_script),
+         "--review-csv",   str(review_csv),
+         "--episode-name", args.episode_name,
+         "--out-dir",      str(args.out_dir)],
+        check=True,
+    )
 
 
 if __name__ == "__main__":
