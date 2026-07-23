@@ -354,6 +354,11 @@ def main() -> None:
                 "uncertain_reasons":    "; ".join(sm.get("uncertain_reasons", [])),
                 "n_samples_matched":    sm.get("n_samples_matched", ""),
                 "boundary_confidence":  sm.get("boundary_confidence", ""),
+                "start_confidence":     sm.get("start_confidence", ""),
+                "end_confidence":       sm.get("end_confidence", ""),
+                "start_uncertain":      sm.get("start_uncertain", ""),
+                "end_uncertain":        sm.get("end_uncertain", ""),
+                "end_info":             sm.get("end_info", ""),
                 "suggested_start":      sm["suggested_start"],
                 "suggested_end":        sm["suggested_end"],
             })
@@ -391,6 +396,11 @@ def main() -> None:
             "uncertain_reasons":   "; ".join(sm.get("uncertain_reasons", [])),
             "n_samples_matched":   sm.get("n_samples_matched", ""),
             "boundary_confidence": sm.get("boundary_confidence", ""),
+            "start_confidence":    sm.get("start_confidence", ""),
+            "end_confidence":      sm.get("end_confidence", ""),
+            "start_uncertain":     sm.get("start_uncertain", ""),
+            "end_uncertain":       sm.get("end_uncertain", ""),
+            "end_info":            sm.get("end_info", ""),
             "suggested_start":     sm["suggested_start"],
             "suggested_end":       sm["suggested_end"],
         })
@@ -488,6 +498,7 @@ def main() -> None:
         "matched_song", "shazam_status", "uncertain_reasons",
         "shazam_offset_s", "duration_s", "duration_source",
         "n_samples_matched", "boundary_confidence",
+        "start_confidence", "end_confidence", "start_uncertain", "end_uncertain", "end_info",
         # Heuristic columns
         "heuristic_start", "heuristic_end", "heuristic_conf",
         # Gap-shazam columns
@@ -522,6 +533,11 @@ def main() -> None:
                 "duration_source":             r.get("duration_source", ""),
                 "n_samples_matched":           r.get("n_samples_matched", ""),
                 "boundary_confidence":         r.get("boundary_confidence", ""),
+                "start_confidence":            r.get("start_confidence", ""),
+                "end_confidence":              r.get("end_confidence", ""),
+                "start_uncertain":             r.get("start_uncertain", ""),
+                "end_uncertain":               r.get("end_uncertain", ""),
+                "end_info":                    r.get("end_info", ""),
                 "heuristic_start":             r.get("heuristic_start", ""),
                 "heuristic_end":               r.get("heuristic_end", ""),
                 "heuristic_conf":              r.get("heuristic_conf", ""),

@@ -63,6 +63,10 @@ def _int(v, default=0) -> int:
         return default
 
 
+def _bool(v) -> bool:
+    return str(v).strip().lower() in ("true", "1", "yes")
+
+
 def classify(row: dict) -> tuple[str, str, float, float]:
     """
     Return (label, reason, cut_start, cut_end).
@@ -77,6 +81,14 @@ def classify(row: dict) -> tuple[str, str, float, float]:
     n_hits         = _int(row.get("n_samples_matched"))
     confidence     = (row.get("boundary_confidence") or "LOW").strip()
     region_type    = (row.get("region_type") or "").strip()
+
+    # Split-confidence fields (present since the 2026-07 recall fix). A DB-duration
+    # overshoot is an END-only signal and must not veto a well-clustered START, so
+    # AUTO now gates on start_confidence; a genuinely bad END → REVIEW-S, not AUTO.
+    start_conf   = (row.get("start_confidence") or "").strip()
+    have_split   = start_conf != ""
+    start_unc    = _bool(row.get("start_uncertain"))
+    end_unc      = _bool(row.get("end_uncertain"))
 
     sugg_start = _float(row.get("suggested_start"))
     sugg_end   = _float(row.get("suggested_end"))
@@ -106,11 +118,16 @@ def classify(row: dict) -> tuple[str, str, float, float]:
     if cut_dur < DROP_SHAZAM_DUR:
         return "DROP?", "shazam_too_short", sugg_start, sugg_end
 
-    # AUTO: multiple confirmed hits, stable boundary
-    if (not uncertain
-            and confidence in ("MEDIUM", "HIGH")
-            and n_hits >= AUTO_MIN_HITS
-            and cut_dur >= AUTO_MIN_DURATION):
+    # AUTO: multiple confirmed hits, stable START boundary.
+    if have_split:
+        auto_ok = (start_conf in ("MEDIUM", "HIGH") and not start_unc and not end_unc
+                   and n_hits >= AUTO_MIN_HITS and cut_dur >= AUTO_MIN_DURATION)
+    else:
+        # Legacy pre-split CSV: fall back to the old blanket-uncertain gate.
+        auto_ok = (not uncertain and confidence in ("MEDIUM", "HIGH")
+                   and n_hits >= AUTO_MIN_HITS and cut_dur >= AUTO_MIN_DURATION)
+
+    if auto_ok:
         # Safety: cut starts well before heuristic region → may include host/ads over intro
         if sugg_start < h_start - EARLY_START_THRESHOLD:
             return "REVIEW-B", "early_start_boundary", sugg_start, sugg_end

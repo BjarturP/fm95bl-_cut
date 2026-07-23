@@ -411,6 +411,8 @@ def _no_match_result(region: dict) -> dict:
         "suggested_start": region["start"], "suggested_end": region["end"],
         "n_samples_total": 0, "n_samples_matched": 0, "start_spread_s": 0.0,
         "boundary_confidence": "LOW",
+        "start_confidence": "LOW", "end_confidence": "LOW",
+        "start_uncertain": True, "end_uncertain": True, "end_info": "",
         "start_snap_note": "", "end_snap_note": "",
         "cut_source": "heuristic_fallback",
         "uncertain": True, "uncertain_reasons": ["no shazam match"],
@@ -523,53 +525,90 @@ async def process_region(
     final_end = snapped_end if snapped_end is not None else final_end_raw
     print(f"    end_snap:   {end_note}", file=sys.stderr)
 
-    # 8. Uncertainty flags
-    uncertain_reasons: list[str] = []
+    # 8. Uncertainty flags — split START vs END.
+    #    Rationale (2026-07 recall fix): a DB-duration overshoot is an END-only
+    #    signal, and the heuristic region end (r_end) is itself known to run
+    #    short (the tail pattern). So a well-clustered START must not be vetoed
+    #    just because the END scan confirmed the song extends past that short
+    #    r_end. DB duration is now display-only; END trust comes from the
+    #    empirical end scan, never from the duration number.
+    start_reasons: list[str] = []
+    end_reasons:   list[str] = []
+    end_info:      list[str] = []   # informational, does NOT lower confidence
+
+    # ── START: can we trust where the song begins? ──
     if n == 1:
-        uncertain_reasons.append("single Shazam hit — boundary is an estimate only")
-    if end_scan_no_hit and not end_scan_from_last_sample and duration is not None:
-        uncertain_reasons.append(
-            f"end scan found no song past region — official duration ({duration:.0f}s) "
-            f"is likely wrong version; end clamped to last observed sample"
-        )
-    if end_scan_no_hit and end_scan_from_last_sample:
-        uncertain_reasons.append(
-            "n=1 end sweep found no song past last sample — end boundary unreliable"
-        )
+        start_reasons.append("single Shazam hit — start is an estimate only")
     if n > 1 and spread > CLUSTER_WARN_S:
-        uncertain_reasons.append(
+        start_reasons.append(
             f"estimated starts spread {spread:.0f}s across {n} samples (>{CLUSTER_WARN_S:.0f}s)"
         )
-    # Clamp and flag if estimated boundaries are implausibly far outside the region
     if final_start < r_start - UNCERTAIN_OVERSHOOT:
-        uncertain_reasons.append(
+        start_reasons.append(
             f"song_start {final_start:.0f}s is {r_start - final_start:.0f}s before region"
         )
         final_start = r_start
-    if final_end > r_end + UNCERTAIN_OVERSHOOT:
+
+    # ── END: is the endpoint empirically supported? ──
+    #   end_confirmed → scan positively heard the song near/after its estimated end
+    #   clamp-to-last-sample → DB duration overshot; end anchored to last heard
+    #                          music (safe: errs short, leaves a little music)
+    #   n=1 sweep miss / no duration → end genuinely unknown
+    end_confirmed = scan_last_t is not None
+    if end_confirmed and final_end > r_end + UNCERTAIN_OVERSHOOT:
+        end_info.append(
+            f"end extends {final_end - r_end:.0f}s past heuristic region "
+            f"(scan-confirmed — heuristic end ran short)"
+        )
+    if end_scan_no_hit and not end_scan_from_last_sample:
+        # n>=2 scan past DB-duration end found nothing → song stopped earlier;
+        # end was anchored to last observed sample. Safe, mildly conservative.
+        end_info.append("end anchored to last observed sample (DB duration overshot)")
+    if end_scan_no_hit and end_scan_from_last_sample:
+        end_reasons.append("n=1 end sweep found no song past last sample — end unreliable")
+    if final_end > r_end + UNCERTAIN_OVERSHOOT and not end_confirmed and duration is None:
         overshoot = final_end - r_end
-        if duration is not None:
-            # Have a duration: keep the estimate but flag it — radio edit / wrong version possible
-            uncertain_reasons.append(
-                f"song_end {final_end:.0f}s is {overshoot:.0f}s past region "
-                f"(using duration; check for radio edit / early fade)"
-            )
-        else:
-            # No duration at all: clamp conservatively
-            uncertain_reasons.append(
-                f"song_end {final_end:.0f}s is {overshoot:.0f}s past region (no duration; clamped)"
-            )
-            final_end = r_end + 5.0
-    # Backwards cut guard (offset > duration)
-    if final_end <= final_start:
-        uncertain_reasons.append(
+        end_reasons.append(
+            f"song_end {final_end:.0f}s is {overshoot:.0f}s past region (no duration; clamped)"
+        )
+        final_end = r_end + 5.0
+
+    # Backwards cut guard (offset > duration) — hard failure, kills both sides
+    reversed_cut = final_end <= final_start
+    if reversed_cut:
+        start_reasons.append(
             f"reversed boundary (end {final_end:.0f}s ≤ start {final_start:.0f}s) — offset > duration?"
         )
         final_start = r_start
         final_end   = r_end
 
-    # 9. Confidence and cut
-    confidence = _boundary_confidence(n, spread, snapped_start is not None, snapped_end is not None)
+    # 9. Per-side confidence + cut
+    snapped_start_ok = snapped_start is not None
+    snapped_end_ok   = snapped_end is not None
+
+    if start_reasons:
+        start_confidence = "LOW"
+    elif n >= 3 and spread < CLUSTER_AGREE_S:
+        start_confidence = "HIGH" if snapped_start_ok else "MEDIUM"
+    elif n >= 2 and spread < CLUSTER_WARN_S:
+        start_confidence = "MEDIUM"
+    else:
+        start_confidence = "LOW"
+
+    if reversed_cut or end_reasons:
+        end_confidence = "LOW"
+    elif end_confirmed:
+        end_confidence = "HIGH" if snapped_end_ok else "MEDIUM"
+    else:
+        end_confidence = "MEDIUM"   # clamped to last observed sample: safe
+
+    start_uncertain = bool(start_reasons)
+    end_uncertain   = bool(end_reasons)
+    # Backward-compat union flag + reason list (still consumed downstream / display)
+    uncertain_reasons = start_reasons + end_reasons
+
+    # Legacy combined confidence (kept for display / older consumers)
+    confidence = _boundary_confidence(n, spread, snapped_start_ok, snapped_end_ok)
     cut_start  = round(max(0.0, final_start - PRE_PADDING), 1)
     cut_end    = round(min(episode_duration, final_end + POST_PADDING), 1)
 
@@ -607,6 +646,11 @@ async def process_region(
         "cut_start":              cut_start,
         "cut_end":                cut_end,
         "boundary_confidence":    confidence,
+        "start_confidence":       start_confidence,
+        "end_confidence":         end_confidence,
+        "start_uncertain":        start_uncertain,
+        "end_uncertain":          end_uncertain,
+        "end_info":               end_info,
         "uncertain_reasons":      uncertain_reasons,
     }
 
@@ -627,10 +671,15 @@ async def process_region(
         "n_samples_matched":     n,
         "start_spread_s":        round(spread, 1),
         "boundary_confidence":   confidence,
+        "start_confidence":      start_confidence,
+        "end_confidence":        end_confidence,
+        "start_uncertain":       start_uncertain,
+        "end_uncertain":         end_uncertain,
+        "end_info":              "; ".join(end_info),
         "start_snap_note":       start_note,
         "end_snap_note":         end_note,
         "cut_source":            f"multi_shazam_{n}_of_{len(sample_pts)}_samples",
-        "uncertain":             len(uncertain_reasons) > 0,
+        "uncertain":             start_uncertain or end_uncertain,
         "uncertain_reasons":     uncertain_reasons,
         "_debug":                debug,
     }
@@ -661,7 +710,8 @@ MATCH_FIELDS = [
     "index", "region_start", "region_end",
     "matched_song", "shazam_offset",
     "n_samples_matched", "n_samples_total", "start_spread_s",
-    "boundary_confidence",
+    "boundary_confidence", "start_confidence", "end_confidence",
+    "start_uncertain", "end_uncertain", "end_info",
     "duration_source", "duration_s",
     "song_start_in_episode", "song_end_in_episode",
     "suggested_start", "suggested_end", "suggested_start_hms", "suggested_end_hms",
@@ -695,7 +745,8 @@ def write_outputs(results: list, out_dir: Path, episode_name: str) -> None:
                 i, r["start"], r["end"],
                 r["matched_song"], r["shazam_offset"],
                 r["n_samples_matched"], r["n_samples_total"], r["start_spread_s"],
-                r["boundary_confidence"],
+                r["boundary_confidence"], r["start_confidence"], r["end_confidence"],
+                r["start_uncertain"], r["end_uncertain"], r.get("end_info", ""),
                 r["duration_source"], r["duration_s"],
                 r["song_start_in_episode"], r["song_end_in_episode"],
                 r["suggested_start"], r["suggested_end"],
