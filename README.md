@@ -129,8 +129,12 @@ Three scripts identify songs, refine boundaries, and classify cuts:
 
 - **`shazam_detect.py`** -- multi-sample Shazam on heuristic candidate
   regions. Sweeps 2–6 clips per region, clusters offset estimates, and
-  probes empirically for the true song end. Outputs
-  `song_matches_<ep>.json` and `boundary_debug_<ep>.json`.
+  probes empirically for the true song end. When the acoustic start-snap
+  finds no speech→music edge (the host talks *over* the song intro, so the
+  music signal never dips to speech level), a transcript **word clawback**
+  pulls the start forward off host talk to the last spoken word before the
+  first sustained wordless gap. Outputs `song_matches_<ep>.json` and
+  `boundary_debug_<ep>.json`.
 - **`shazam_gap_scan.py`** -- scans large gaps (default ≥3 min) between
   finalcut candidates at 45s intervals. Finds songs the heuristic missed.
   Validated on two episodes: zero false positives in genuinely silent gaps.

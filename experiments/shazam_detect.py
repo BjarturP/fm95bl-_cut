@@ -70,6 +70,11 @@ SNAP_RADIUS          = 30.0   # search ±Xs from estimated boundary
 SNAP_SMOOTH_WIN      = 7      # smooth signal window half-width (seconds each side)
 MUSIC_LO             = 0.30   # signal below this = clear speech
 
+CLAWBACK_MAX         = 25.0   # never move a start more than this far forward
+CLAWBACK_MUSIC_GAP   = 6.0    # a wordless stretch ≥ this = host stopped, music alone
+CLAWBACK_PROBE       = 4.0    # no host word within this of the estimate → already
+                              #   on clean music, nothing to claw back
+
 END_SCAN_PROBES      = 4      # clips to probe past region end (n≥2 path)
 END_SCAN_PROBES_N1   = 10    # clips for single-hit forward sweep
 END_SCAN_STEP        = 30.0   # spacing between end-scan probes
@@ -298,6 +303,66 @@ def snap_boundary(
     return float(best), f"{direction} snap {dist:.0f}s {direction_word} → {_hms(best)}"
 
 
+def clawback_start(
+    est_start: float,
+    region_end: float,
+    words: list[dict],
+    max_move: float = CLAWBACK_MAX,
+    music_gap: float = CLAWBACK_MUSIC_GAP,
+    probe:    float = CLAWBACK_PROBE,
+) -> tuple[float | None, str]:
+    """
+    Pull a music-cut start forward off host talk-over-intro, using the transcript.
+
+    The acoustic snap fails when the host talks *over* the song intro: the music
+    signal is already high, so there is no speech→music rising edge to snap to and
+    we fall back to the raw Shazam offset, which sits ~10s early, inside the talk.
+    The transcript still shows the seam — a run of host words, then a sustained
+    wordless gap once the host stops and music plays alone. Move the start to the
+    end of the last spoken word before that first sustained gap.
+
+    Only ever moves the start *later*, never earlier, never past region_end, and
+    never more than max_move. Returns (new_start, note) if a clawback applies,
+    else (None, reason) — and only fires when a real speech→music onset is found,
+    so continuous host talk or continuous sung vocals leave the start untouched.
+    """
+    window_end = min(region_end, est_start + max_move)
+    # Words overlapping [est_start, window_end]: host speech at/after the estimate.
+    talk = sorted(
+        (w for w in words
+         if w.get("end", 0.0) > est_start and w.get("start", 0.0) < window_end),
+        key=lambda w: w["start"],
+    )
+
+    if not talk or talk[0]["start"] > est_start + probe:
+        # No host words right after the estimate → already clean music. Leave it.
+        return None, "clawback: start already on clean audio"
+
+    # Walk forward; stop at the first sustained wordless gap = host stopped talking.
+    prev_end = talk[0]["end"]
+    gap_found = False
+    for w in talk[1:]:
+        if w["start"] - prev_end >= music_gap:
+            gap_found = True           # gap before this word: music took over at prev_end
+            break
+        prev_end = w["end"]
+    else:
+        # No inter-word gap; is there a trailing gap out to the window edge?
+        if window_end - prev_end >= music_gap:
+            gap_found = True
+
+    if not gap_found:
+        # Host talks continuously through the window — can't locate the music
+        # onset, so don't guess. Keep the acoustic/Shazam estimate.
+        return None, "clawback: host talk continuous, no music onset found"
+
+    new_start = min(prev_end, window_end)
+    if new_start <= est_start + 1.0:
+        return None, "clawback: no forward move"
+    moved = new_start - est_start
+    return round(new_start, 1), f"clawback +{moved:.0f}s off host talk → {_hms(new_start)}"
+
+
 # ── Multi-sample sweep ─────────────────────────────────────────────────────────
 
 def sample_region_points(
@@ -425,8 +490,10 @@ async def process_region(
     region: dict,
     episode_duration: float,
     smoothed: list[float],
+    words: list[dict] | None = None,
 ) -> dict:
     r_start, r_end = region["start"], region["end"]
+    words = words or []
 
     # 1. Sample points
     sample_pts = sample_region_points(r_start, r_end)
@@ -476,6 +543,18 @@ async def process_region(
     snapped_start, start_note = snap_boundary(smoothed, median_start, "start")
     final_start = snapped_start if snapped_start is not None else median_start
     print(f"    start_snap: {start_note}", file=sys.stderr)
+
+    # 5b. Word clawback — only when the acoustic snap found no speech→music edge
+    #     (the talk-over-intro signature: host talks over the song intro, so the
+    #     music signal never dips to speech level and there is nothing to snap
+    #     to). Pull the start forward off host talk using the transcript.
+    if snapped_start is None:
+        clawed_start, claw_note = clawback_start(final_start, r_end, words)
+        if clawed_start is not None:
+            final_start = clawed_start
+    else:
+        claw_note = "clawback: skipped (acoustic snap succeeded)"
+    print(f"    clawback:   {claw_note}", file=sys.stderr)
 
     # 6. Estimate end: duration is reference; end scan finds the truth
     est_end_from_dur     = (median_start + duration) if duration else None
@@ -640,6 +719,7 @@ async def process_region(
         "scan_last_match_t":      round(scan_last_t, 1) if scan_last_t else None,
         "final_end_raw":          round(final_end_raw, 1),
         "start_snap_note":        start_note,
+        "clawback_note":          claw_note,
         "end_snap_note":          end_note,
         "final_start":            round(final_start, 1),
         "final_end":              round(final_end, 1),
@@ -692,6 +772,7 @@ async def run_all(
     candidates: list,
     episode_duration: float,
     smoothed: list[float],
+    words: list[dict] | None = None,
 ) -> list:
     results = []
     for i, region in enumerate(candidates):
@@ -699,7 +780,7 @@ async def run_all(
             f"\n  [{i+1}/{len(candidates)}] {region['start']:.0f}–{region['end']:.0f}s",
             file=sys.stderr,
         )
-        result = await process_region(audio_path, region, episode_duration, smoothed)
+        result = await process_region(audio_path, region, episode_duration, smoothed, words)
         results.append(result)
     return results
 
@@ -850,17 +931,24 @@ def main():
         features_windows = []
 
     transcript_segments: list[dict] = []
+    words: list[dict] = []
     if args.transcript:
         tr = json.loads(args.transcript.read_text(encoding="utf-8"))
         transcript_segments = tr.get("segments", [])
+        for seg in transcript_segments:
+            for w in seg.get("words", []):
+                if "start" in w and "end" in w:
+                    words.append({"start": w["start"], "end": w["end"]})
+        words.sort(key=lambda w: w["start"])
 
     print(f"Building acoustic signal ({len(features_windows)} feature windows, "
-          f"{len(transcript_segments)} transcript segments) ...", file=sys.stderr)
+          f"{len(transcript_segments)} transcript segments, {len(words)} words) ...",
+          file=sys.stderr)
     raw_signal = build_music_signal(features_windows, transcript_segments, episode_duration)
     smoothed   = smooth_signal(raw_signal)
 
     print(f"Scanning {len(candidates)} candidate regions in {args.audio.name} ...", file=sys.stderr)
-    results = asyncio.run(run_all(args.audio, candidates, episode_duration, smoothed))
+    results = asyncio.run(run_all(args.audio, candidates, episode_duration, smoothed, words))
 
     print_summary_table(results, args.episode_name)
     write_outputs(results, args.out_dir, args.episode_name)
