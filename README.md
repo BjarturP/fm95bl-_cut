@@ -139,15 +139,15 @@ Three scripts identify songs, refine boundaries, and classify cuts:
 - **`hybrid_review.py`** -- classifies each row into one of five categories
   (see step 7 above) and writes the ready-to-use output files.
 
-**Cross-episode validation (2 labeled episodes, 2011 and 2012):**
+**Cross-episode validation (3 labeled episodes, 2011 and 2012), with the
+start/end boundary-confidence split:**
 
-| | fm95blo-2011-11-09 | fm95blo-2012-02-28 | Combined |
-|---|---|---|---|
-| AUTO cuts | 5 | 6 | **11** |
-| AUTO precision | 100% | 100% | **100%** |
-| AUTO recall | 38% (5/13) | 55% (6/11) | — |
-| Auto-cuttable duration | 18.5 min | 21.1 min | **39.6 min** |
-| False positives | 0 | 0 | **0** |
+| | 2011-11-09 | 2012-02-28 | 2012-03-09 | Combined |
+|---|---|---|---|---|
+| AUTO cuts | 8 | 6 | 6 | **20** |
+| AUTO precision | 100% | 100% | 100% | **100%** |
+| AUTO recall | 62% | 55% | 50% | — |
+| False positives | 0 | 0 | 0 | **0** |
 
 **Safety rules in `hybrid_review.py`:**
 - Requires ≥2 Shazam hits (`AUTO_MIN_HITS = 2`)
@@ -156,10 +156,12 @@ Three scripts identify songs, refine boundaries, and classify cuts:
   instead of `[AUTO]` (song may be playing under host talk or ads)
 - Single-hit matches → `[REVIEW-S]` regardless of other criteria
 
-The lower recall on the 2011 episode (38% vs 55%) is expected: that
-episode has more Icelandic music (not in Shazam's database) and more
-UNCERTAIN boundary estimates. All missed GT cuts appear in REVIEW
-categories and are caught during manual review.
+Recall varies by episode mostly with Icelandic-music density (not in
+Shazam's database) — all missed GT cuts still appear in REVIEW categories
+and are caught during manual review. The start/end split recovered +8
+real-music AUTO cuts over the earlier blanket-uncertain gate (2011
+38%→62%, 2012-03-09 10%→50%) with no precision loss, by no longer letting
+a DB-duration overshoot (an end-only signal) veto a well-clustered start.
 
 ## Calibrating against your labeled example episode
 
