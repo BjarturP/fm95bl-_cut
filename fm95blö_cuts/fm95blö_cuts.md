@@ -216,7 +216,7 @@ Data files present in `data/` but no ground truth labels yet. Do not evaluate pi
 - `[EXT]` — gap-scan tail extension suggestion
 - `[DROP?]` — short/weak, likely not music
 
-**Cross-episode AUTO precision: 100% (0 FP) across all episodes — 38/38 AUTO cuts as of Session 14 (2026-07-25):**
+**Cross-episode AUTO precision: 100% (0 FP) across all episodes — 48/48 AUTO cuts as of Session 15 (2026-07-25):**
 
 | Episode | AUTO precision | AUTO recall | Coverage |
 |---|---|---|---|
@@ -224,9 +224,10 @@ Data files present in `data/` but no ground truth labels yet. Do not evaluate pi
 | 2012-01-30 | 10/10 = 100% | 91% (10/11) | 11/11 |
 | 2012-02-28 | 8/8 = 100% | 73% (8/11) | 11/11 |
 | 2012-03-09 (ext. GT) | 10/10 = 100% | 83% (10/12) | 12/12 |
-| **Cumulative** | **38/38 = 100%** | **81% (38/47)** | **47/47** |
+| 2012-03-02 (ext. GT, **blind test**) | 10/10 = 100% | 77% (10/13) | 13/13 |
+| **Cumulative** | **48/48 = 100%** | **80% (48/60)** | **60/60** |
 
-NOTE: 2012-03-09 uses the extended GT (`2012-03-09_actual_cuts_extended.txt`); 2011 GT saved as `data/labels/2011-11-09_actual_cuts.txt` (music cuts from this note's table). Score any episode with `scripts/eval_hybrid_vs_gt.py --episode-name <ep> --gt-file <gt>`.
+NOTE: 2012-03-09 and 2012-03-02 use extended GT files (`*_actual_cuts_extended.txt` — closing ads/music blocks added after auditioning); 2011 GT saved as `data/labels/2011-11-09_actual_cuts.txt` (music cuts from this note's table). Score any episode with `scripts/eval_hybrid_vs_gt.py --episode-name <ep> --gt-file <gt>`. **2012-03-02 was the first fully-blind test** — processed end-to-end with the Session 14 pipeline before any labels existed.
 
 **Session 13 (2026-07-24) — two detection fixes, UNCOMMITTED, validated on 2012-01-30 only:**
 1. **Merge fix (`finalize_cuts.py` + `config.py`)** — a short-gap bridge is now blocked when it would grow a cut past `FINAL_MERGE_MAX_CLEAN_BLOCK`=600s AND the gap carries host speech. Stops distinct breaks being glued into one 15-min cut across DJ talk. Simulated on all 4 eps first: only 3 regions split total, each correct (2011 19-min opener, 2012-03-09 Lil Wayne/Coldplay separation, 2012-01-30 GT3 recovery). Region-level GT coverage stayed 100% everywhere.
@@ -797,6 +798,23 @@ Three breaks recovered as AUTO: **GT3 → David Guetta – Titanium** (the split
 - `scripts/sim_merge_gate.py` — the offline merge-threshold simulation across all 4 labeled episodes (the pre-edit validation for fix #1; re-run to justify any future threshold change). `PYTHONPATH=. .venv/bin/python scripts/sim_merge_gate.py`
 - `scripts/eval_hybrid_vs_gt.py` — scores `hybrid_review_<ep>.csv` against a GT file (AUTO precision/recall, per-GT boundary table). Currently hardcoded to 2012-01-30; generalize the paths for other episodes.
 - `scripts/rerun_downstream.sh <ep>` — re-runs stages 5-8 (review_export → shazam → gap_scan → make_review) after a finalize change. For a full re-validation, run `finalize_cuts.py` first, then this.
+
+---
+
+### 2026-07-25 — Session 15: 5th episode fm95blo-2012-03-02 — first fully-BLIND test — 10/10 AUTO precision
+
+**Setup:** User supplied `episodes/fm95blo-2012-03-02-mp3.mp3` (2h01m, 7278s). Full 8-stage pipeline run in background (transcribe 1h49m, total 2h22m; first attempt was killed ~32 min in — transient, restart completed cleanly). All Session-14 features active (merge gate, gap-scan AUTO, tail auto-extension, remainder rows). **Predictions were made and shown to the user BEFORE any labels existed** — a true blind test.
+
+**Blind results vs user GT (12 music cuts + closing block):**
+- **AUTO precision 10/10 = 100%.** The one AUTO cut outside the original labels (Labrinth – Last Time, 1:56:25–2:01:02) was resolved by the user: the show ends at 1:46:54 and everything after is ads/music, so the cut removed music, not host content. Closing block added as extended GT (`2012-03-02_actual_cuts_extended.txt`), mirroring the 03-09 precedent.
+- **AUTO recall 10/13 = 77%; coverage 13/13.** The 3 non-AUTO GT cuts (1:20:56, 1:36:05, 1:42:05) are all covered by REVIEW-H rows — Shazam couldn't name them (Icelandic gap).
+- **Boundaries tight:** median AUTO error ~5s; worst start −8s; worst end −58s (Iyaz, errs short = safe).
+- Tiësto – Adagio for Strings (1:15:10, single hit, inside the show, not in GT) correctly HELD at REVIEW-S — the single-hit gate did its job. User should audition during review (possible bed music under talk).
+- Minor cosmetic: redundant EXT rows appear when the AUTO end already extends past the gap-scan tail (Flo Rida, Enrique) — suppress `EXT` when `gs_end <= cut_end` in a future pass.
+
+**Cumulative: 48/48 AUTO = 100% precision, 0 FP, across 5 episodes; recall 80% (48/60); coverage 60/60.**
+
+**Commits made:** note update (this entry), pushed.
 
 ---
 
