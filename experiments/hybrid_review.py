@@ -29,6 +29,7 @@ Run make_review.py first to produce review_sheet_<ep>.csv.
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 
@@ -43,6 +44,83 @@ SHAZAM_CONFUSED_DUR   = 45.0   # Shazam cut < this AND much shorter than heurist
 SHAZAM_CONFUSED_RATIO = 3.0    # ...when heuristic region > Shazam cut * this ratio
 TAIL_EXT_MARGIN       = 5.0    # pull back this far from last scan-confirmed music when
                                # auto-applying a same-song tail extension (errs short)
+
+# AUTO cuts are DELETED without review, so both edges must err toward leaving
+# music in, never toward eating host talk. shazam_detect/gap_scan pad every
+# suggested cut outward (PRE_PADDING=3 before the song, POST_PADDING=5 after)
+# — right for human review, wrong for unreviewed deletion. AUTO rows undo the
+# padding and add a small inward safety margin on top.
+AUTO_START_TRIM = 3.0 + 2.0    # undo PRE_PADDING, then 2s inward safety
+AUTO_END_TRIM   = 5.0 + 3.0    # undo POST_PADDING, then 3s inward safety
+
+# Word-guard: transcribed host speech inside an AUTO cut near its edge pulls
+# the edge inward past the speech. Catches the Shazam-estimate outliers the
+# fixed trim can't (e.g. a start 45s early inside DJ talk).
+GUARD_NSP_MAX  = 0.5   # segments with no_speech_prob >= this are sung/garbled, ignored
+GUARD_WIN      = 45.0  # how far inside the cut edge to look for host speech
+GUARD_EDGE     = 3.0   # speech must start/end within this of the edge to count as "at the edge"
+GUARD_GAP      = 4.0   # wordless gap that marks where the speech stops and music alone begins
+GUARD_PAD      = 1.0   # land this far inside the wordless gap
+
+
+def load_speech_words(transcript_path: Path) -> list[tuple[float, float]]:
+    """(start, end) of transcript words from speech-like segments, sorted."""
+    with transcript_path.open(encoding="utf-8") as f:
+        data = json.load(f)
+    words: list[tuple[float, float]] = []
+    for seg in data.get("segments", []):
+        if seg.get("no_speech_prob", 0.0) >= GUARD_NSP_MAX:
+            continue
+        for w in seg.get("words", []):
+            words.append((float(w["start"]), float(w["end"])))
+    words.sort()
+    return words
+
+
+def word_guard(cut_s: float, cut_e: float,
+               words: list[tuple[float, float]]) -> tuple[float, float, str]:
+    """
+    Pull AUTO cut edges inward past any host speech sitting at the edge.
+    Returns (new_start, new_end, note). Moves are bounded by GUARD_WIN; if
+    speech runs deeper than that with no wordless gap, the edge is left alone
+    (caller keeps the row AUTO — the trim already applied — but the note says
+    the guard could not anchor).
+    """
+    notes = []
+
+    # START edge: speech overlapping [cut_s, cut_s+WIN] that begins at the edge
+    in_win = [w for w in words if w[1] > cut_s and w[0] < cut_s + GUARD_WIN]
+    if in_win and in_win[0][0] <= cut_s + GUARD_EDGE:
+        anchor = None
+        for a, b in zip(in_win, in_win[1:]):
+            if b[0] - a[1] >= GUARD_GAP:
+                anchor = a[1]
+                break
+        if anchor is None and in_win[-1][1] < cut_s + GUARD_WIN - GUARD_GAP:
+            anchor = in_win[-1][1]          # speech ends, then silence to window edge
+        if anchor is not None:
+            notes.append(f"start guarded +{anchor + GUARD_PAD - cut_s:.0f}s (speech at edge)")
+            cut_s = anchor + GUARD_PAD
+        else:
+            notes.append("start guard: speech at edge but no anchor within window")
+
+    # END edge: speech overlapping [cut_e-WIN, cut_e] that runs to the edge
+    in_win = [w for w in words if w[0] < cut_e and w[1] > cut_e - GUARD_WIN]
+    if in_win and in_win[-1][1] >= cut_e - GUARD_EDGE:
+        anchor = None
+        for a, b in zip(reversed(in_win[:-1]), reversed(in_win[1:])):
+            if b[0] - a[1] >= GUARD_GAP:
+                anchor = b[0]
+                break
+        if anchor is None and in_win[0][0] > cut_e - GUARD_WIN + GUARD_GAP:
+            anchor = in_win[0][0]
+        if anchor is not None:
+            notes.append(f"end guarded -{cut_e - (anchor - GUARD_PAD):.0f}s (speech at edge)")
+            cut_e = anchor - GUARD_PAD
+        else:
+            notes.append("end guard: speech at edge but no anchor within window")
+
+    return cut_s, cut_e, "; ".join(notes)
 
 
 def hms(s: float) -> str:
@@ -216,12 +294,24 @@ def main() -> None:
                         help="review_sheet_<ep>.csv from make_review.py")
     parser.add_argument("--episode-name", required=True)
     parser.add_argument("--out-dir",      type=Path, default=Path("data/labels"))
+    parser.add_argument("--transcript",   type=Path, default=None,
+                        help="transcript json for the word-guard "
+                             "(default: data/transcripts/<episode-name>.json)")
     args = parser.parse_args()
 
     # ── Load review sheet ─────────────────────────────────────────────────────
     rows: list[dict] = []
     with args.review_csv.open(encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
+
+    # ── Load transcript words for the AUTO word-guard ─────────────────────────
+    transcript = args.transcript or Path(f"data/transcripts/{args.episode_name}.json")
+    speech_words: list[tuple[float, float]] = []
+    if transcript.exists():
+        speech_words = load_speech_words(transcript)
+        print(f"Word-guard: {len(speech_words)} speech words from {transcript.name}")
+    else:
+        print(f"Word-guard: transcript {transcript} not found — guard disabled")
 
     # ── Classify each primary row ─────────────────────────────────────────────
     classified: list[dict] = []
@@ -253,6 +343,20 @@ def main() -> None:
             reason += "+tail_extended"
             tail_extended = True
 
+        # Inward safety trim for unreviewed deletion (see AUTO_*_TRIM above).
+        # Ends set from scan-confirmed music (tail extension / gap-find floor)
+        # already carry their own margin and are not trimmed again.
+        guard_note = ""
+        if label == "AUTO":
+            cut_s += AUTO_START_TRIM
+            end_from_scan_floor = tail_extended or (
+                reason == "gap_shazam_verified"
+                and abs(cut_e - (gs_last_conf - TAIL_EXT_MARGIN)) < 0.01)
+            if not end_from_scan_floor:
+                cut_e -= AUTO_END_TRIM
+            if speech_words:
+                cut_s, cut_e, guard_note = word_guard(cut_s, cut_e, speech_words)
+
         dur = cut_e - cut_s
 
         # When the row was classified off the gap-scan match (a new_gap_find),
@@ -283,6 +387,7 @@ def main() -> None:
             "auto_cut":           label == "AUTO",
             "review_priority":    review_priority(label, row),
             "reason_text":        reason,
+            "guard_note":         guard_note,
             "merge_note":         (row.get("merge_note") or "").strip(),
             "uncertain_reasons":  (row.get("uncertain_reasons") or "").strip(),
             "heuristic_start":    row.get("heuristic_start", ""),
@@ -363,7 +468,7 @@ def main() -> None:
         "start", "end", "start_hms", "end_hms", "duration_s",
         "song", "source", "boundary_confidence", "n_hits",
         "auto_cut", "review_priority",
-        "merge_note", "uncertain_reasons",
+        "guard_note", "merge_note", "uncertain_reasons",
         "heuristic_start", "heuristic_end", "heuristic_conf",
         "shazam_status",
         "gap_shazam_song", "gap_shazam_start", "gap_shazam_end", "gap_shazam_type",
