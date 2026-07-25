@@ -243,6 +243,7 @@ Continue refining `detect_breaks.py` + `finalize_cuts.py` signals. Do not change
 
 ## Next Recommended Step
 
+0. **Grow the rotation database: process more episodes.** `experiments/cross_episode_match.py` identifies unknown regions by finding the same audio in other episodes (validated: 100% frame-identity cross match between 2011 and 2012-03-02). With only 5 episodes there is 1 repeat; every new episode multiplies overlap. Also: obtain known Icelandic songs as mp3s → `experiments/song_refs/` → `song_fingerprint.py` names them directly.
 1. **Merged-row confidence recomputation (top recall lead, ~2 cuts).** Same-song merged rows (Florence – Shake It Out on 2012-01-30, Drake on 2012-02-28) stay REVIEW-S even when the merged evidence is strong (n=3–4 combined hits, measured boundary error ≤ 15s). The uncertainty flags come from a weak constituent and reference the PRE-merge region ("song_start 174s before region" is stale after the merge widens the region). Fix: recompute start/end confidence after `merge_same_song_rows` against the merged region; consider AUTO when merged n_hits ≥ 3 and the constituent ranges overlap (gap ≤ 0 ⇒ one continuous play). Precision-critical — validate on all 4 episodes before committing.
 2. **Heuristic start over-expansion (idea 3, other half).** REVIEW-H starts from `finalize_cuts`/`expand_boundaries` skew early (Zorba −120s on 2012-02-28). The committed `clawback_start` helper could be reused with a larger window on heuristic-only rows in `make_review`. Riskier (recall-critical heuristic core).
 3. **Icelandic music coverage** — Shazam still misses most Icelandic songs (2011 GT2, 03-09 GT9). The new region_remainder rows at least keep them visible for manual review. No real fix without a local fingerprint database.
@@ -798,6 +799,24 @@ Three breaks recovered as AUTO: **GT3 → David Guetta – Titanium** (the split
 - `scripts/sim_merge_gate.py` — the offline merge-threshold simulation across all 4 labeled episodes (the pre-edit validation for fix #1; re-run to justify any future threshold change). `PYTHONPATH=. .venv/bin/python scripts/sim_merge_gate.py`
 - `scripts/eval_hybrid_vs_gt.py` — scores `hybrid_review_<ep>.csv` against a GT file (AUTO precision/recall, per-GT boundary table). Currently hardcoded to 2012-01-30; generalize the paths for other episodes.
 - `scripts/rerun_downstream.sh <ep>` — re-runs stages 5-8 (review_export → shazam → gap_scan → make_review) after a finalize change. For a full re-validation, run `finalize_cuts.py` first, then this.
+
+---
+
+### 2026-07-25 — Session 16: host-talk safety hardening + cross-episode Icelandic matcher
+
+**User direction:** (1) never cut into host talk; (2) find a way to identify Icelandic music.
+
+**Safety (`435d12b`, hybrid_review.py):**
+- **AUTO padding undo + inward trim.** shazam_detect/gap_scan pad every cut outward (PRE 3s / POST 5s) — right for review, wrong for unreviewed deletion. AUTO rows now trim inward: start +5s, end −8s net (scan-floored ends keep their own −5s margin).
+- **Transcript word-guard.** Host-speech words (`no_speech_prob < 0.5` segments) at an AUTO edge pull the edge past the speech to the first ≥4s wordless gap (bounded 45s; `--transcript` defaults to `data/transcripts/<ep>.json`). Fixed Calvin Harris −45s→−6s, Daughtry −17s→+16s. Refuses to move when vocals transcribe like speech (English choruses) — errs toward leaving music.
+- **Result across 48 AUTO cuts:** dangerous-direction range [−45,+22]s → **[−8,+19]s**, medians +1.3/−13.1s (safe side). Precision/recall unchanged (48/48, 80%). `guard_note` column in hybrid_review CSV records every guard action.
+
+**Icelandic (`92338e6`, experiments/cross_episode_match.py):**
+- Cross-episode chromaprint matcher: fingerprints all REVIEW-H regions (60s query slices tiling long blocks, sliding Hamming match, fully offline) and reports repeats. A cross-episode repeat = recorded rotation content, NOT live host talk.
+- First run: **1 repeat found at 100% frame identity** — 2011 1:04:48–1:08:41 (contains the GT8 break Shazam couldn't name) ≡ audio inside 2012-03-02's closing block. Other unknowns don't recur within these 5 episodes — value scales with library size.
+- Naming path ready: put known Icelandic mp3s in `experiments/song_refs/` → `song_fingerprint.py` identifies by name.
+
+**Commits made:** `435d12b`, `92338e6`, note update. Pushed.
 
 ---
 
