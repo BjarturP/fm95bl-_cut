@@ -413,6 +413,7 @@ def main() -> None:
         row.setdefault("gap_shazam_end",               "")
         row.setdefault("gap_shazam_status",            "")
         row.setdefault("gap_shazam_type",              "")
+        row.setdefault("gap_shazam_n_hits",            "")
         row.setdefault("gap_shazam_uncertain_reasons", "")
 
     used_gs: set[int] = set()
@@ -439,6 +440,7 @@ def main() -> None:
             row["gap_shazam_end"]               = gs["suggested_end"]
             row["gap_shazam_status"]            = "UNCERTAIN" if gs["uncertain"] else "ok"
             row["gap_shazam_type"]              = gs_type
+            row["gap_shazam_n_hits"]            = gs.get("n_windows_matched", "")
             row["gap_shazam_uncertain_reasons"] = "; ".join(gs.get("uncertain_reasons", []))
             row["region_type"]                  = row["region_type"] + "+gap_shazam"
 
@@ -465,6 +467,7 @@ def main() -> None:
             "gap_shazam_end":              gs["suggested_end"],
             "gap_shazam_status":           "UNCERTAIN" if gs["uncertain"] else "ok",
             "gap_shazam_type":             gs_type,
+            "gap_shazam_n_hits":           gs.get("n_windows_matched", ""),
             "gap_shazam_uncertain_reasons": "; ".join(gs.get("uncertain_reasons", [])),
         })
 
@@ -503,7 +506,7 @@ def main() -> None:
         "heuristic_start", "heuristic_end", "heuristic_conf",
         # Gap-shazam columns
         "gap_shazam_song", "gap_shazam_start", "gap_shazam_end",
-        "gap_shazam_status", "gap_shazam_type", "gap_shazam_uncertain_reasons",
+        "gap_shazam_status", "gap_shazam_type", "gap_shazam_n_hits", "gap_shazam_uncertain_reasons",
         # Merge info
         "merge_note",
         # Fill these in during review
@@ -546,6 +549,7 @@ def main() -> None:
                 "gap_shazam_end":              r.get("gap_shazam_end", ""),
                 "gap_shazam_status":           r.get("gap_shazam_status", ""),
                 "gap_shazam_type":             r.get("gap_shazam_type", ""),
+                "gap_shazam_n_hits":           r.get("gap_shazam_n_hits", ""),
                 "gap_shazam_uncertain_reasons": r.get("gap_shazam_uncertain_reasons", ""),
                 "merge_note":          r.get("merge_note", ""),
                 "actual_start":    "", "actual_end":     "",

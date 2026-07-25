@@ -206,9 +206,24 @@ async def shazam_clip(audio_path: Path, start: float, end: float) -> dict | None
         tmp_path = tmp.name
     try:
         extract_wav(audio_path, start, end, tmp_path)
-        result = await shazam.recognize(tmp_path)
+        # The free Shazam endpoint intermittently rate-limits or returns
+        # undecodable JSON. Retry a couple of times with backoff, then treat this
+        # single clip as "no match" so one bad response can't abort a 70-clip scan.
+        result = None
+        for attempt in range(3):
+            try:
+                result = await shazam.recognize(tmp_path)
+                break
+            except Exception as e:
+                if attempt == 2:
+                    print(f"    [shazam] clip {start:.0f}-{end:.0f}s failed after "
+                          f"retries ({type(e).__name__}); treating as no match", flush=True)
+                else:
+                    await asyncio.sleep(2.0 * (attempt + 1))
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+    if not result:
+        return None
     matches = result.get("matches", [])
     track   = result.get("track")
     if not matches or not track:

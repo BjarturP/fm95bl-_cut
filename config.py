@@ -62,6 +62,7 @@ EXPAND_MAX_SECONDS = 180.0        # cap on how far a boundary can grow outward i
 # output) into cuts you'd actually trust by default.
 FINAL_STRONG_CONFIDENCE = 0.5          # candidates at/above this count as "strong" for bridging/anchoring decisions
 FINAL_MERGE_GAP_DEFAULT = 45.0         # seconds; always bridge gaps this short between surviving candidates
+FINAL_MERGE_MAX_CLEAN_BLOCK = 600.0    # seconds; a short-gap bridge that would grow a region past this is only allowed if the gap has NO host speech -- stops distinct breaks being glued into one 15-min cut across DJ talk
 FINAL_MERGE_GAP_LONG_BLOCK = 90.0      # seconds; bridge gaps up to this long ONLY between long blocks with no real talk between them
 FINAL_MERGE_LONG_BLOCK_MIN_DURATION = 90.0  # a candidate counts as "long" (eligible for the wider gap above) once it's at least this long
 FINAL_MERGE_GAP_SPEECH_RATE_NORM = 0.45     # gap avg rate_norm at/above this = real host conversation, blocks bridging

@@ -103,7 +103,18 @@ def merge_final(candidates: list, timestamps: list, rate_norm: list, episode_dur
         if gap <= 0:
             bridge = True
         elif gap <= config.FINAL_MERGE_GAP_DEFAULT:
-            bridge = True
+            # Short gaps normally always bridge (a brief dip inside one song).
+            # But if bridging would grow this region past MAX_CLEAN_BLOCK AND the
+            # gap itself carries real host speech, we're gluing two distinct
+            # breaks across a talk stretch (two different songs, or a song and
+            # the next break separated by DJ chat). Keep them apart so the talk
+            # isn't cut and each break stays independently reviewable.
+            would_len = max(last["end"], c["end"]) - last["start"]
+            if (would_len > config.FINAL_MERGE_MAX_CLEAN_BLOCK
+                    and gap_has_host_speech(last["end"], c["start"], timestamps, rate_norm)):
+                bridge = False
+            else:
+                bridge = True
         elif near_eof and gap <= config.FINAL_EOF_MERGE_GAP_MAX:
             # No host-speech gate here on purpose: a candidate sitting this
             # close to the literal end of the recording is almost certainly

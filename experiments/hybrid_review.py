@@ -98,8 +98,28 @@ def classify(row: dict) -> tuple[str, str, float, float]:
     h_end   = _float(row.get("heuristic_end"),   default=sugg_end)
     h_dur   = h_end - h_start
 
-    # ── No Shazam match: heuristic-only path ─────────────────────────────────
+    # ── No normal Shazam match ────────────────────────────────────────────────
     if not matched_song:
+        # Gap-scan-only find: a song Shazam matched entirely inside a heuristic
+        # gap (both the heuristic and the normal Shazam pass missed it). Classify
+        # on the gap match itself, gated the same way normal Shazam AUTO is, using
+        # the gap-scan boundaries. Without this these real songs fall through to
+        # "REVIEW-H (no match)" and their identified title is thrown away.
+        gs_song = (row.get("gap_shazam_song") or "").strip()
+        gs_type = (row.get("gap_shazam_type") or "").strip()
+        if gs_song and gs_type == "new_gap_find":
+            gs_s   = _float(row.get("gap_shazam_start"))
+            gs_e   = _float(row.get("gap_shazam_end"))
+            gs_dur = gs_e - gs_s
+            gs_unc = (row.get("gap_shazam_status") or "").strip() == "UNCERTAIN"
+            gs_hits = _int(row.get("gap_shazam_n_hits"))
+            if gs_dur < DROP_SHAZAM_DUR:
+                return "DROP?", "gap_shazam_too_short", gs_s, gs_e
+            if (not gs_unc and gs_hits >= AUTO_MIN_HITS and gs_dur >= AUTO_MIN_DURATION):
+                return "AUTO", "gap_shazam_verified", gs_s, gs_e
+            return "REVIEW-S", "gap_shazam_uncertain", gs_s, gs_e
+
+        # heuristic-only path
         if cut_dur < DROP_HEURISTIC_DUR:
             return "DROP?", "short_heuristic", sugg_start, sugg_end
         return "REVIEW-H", "heuristic_only", sugg_start, sugg_end
@@ -207,6 +227,19 @@ def main() -> None:
         gs_type  = (row.get("gap_shazam_type") or "").strip()
         gs_unc   = (row.get("gap_shazam_status") or "") == "UNCERTAIN"
 
+        # When the row was classified off the gap-scan match (a new_gap_find),
+        # surface the gap-scan song + hit count instead of the empty normal-Shazam
+        # fields, so the row shows what it actually is rather than "(no match)".
+        from_gap = reason.startswith("gap_shazam")
+        song_disp = (row.get("matched_song") or "").strip()
+        n_hits_disp = row.get("n_samples_matched", "")
+        conf_disp = confidence_display(row)
+        if from_gap:
+            song_disp = gs_song
+            n_hits_disp = row.get("gap_shazam_n_hits", "")
+            gs_flag = "⚠" if gs_unc else "✓"
+            conf_disp = f"gap_scan {gs_flag} ({n_hits_disp} hits)" if n_hits_disp else f"gap_scan {gs_flag}"
+
         classified.append({
             "label":               label,
             "reason":              reason,
@@ -215,10 +248,10 @@ def main() -> None:
             "start_hms":          hms(cut_s),
             "end_hms":            hms(cut_e),
             "duration_s":         round(dur, 1),
-            "song":               (row.get("matched_song") or "").strip(),
+            "song":               song_disp,
             "source":             source_tag(row),
-            "boundary_confidence": confidence_display(row),
-            "n_hits":             row.get("n_samples_matched", ""),
+            "boundary_confidence": conf_disp,
+            "n_hits":             n_hits_disp,
             "auto_cut":           label == "AUTO",
             "review_priority":    review_priority(label, row),
             "reason_text":        reason,
