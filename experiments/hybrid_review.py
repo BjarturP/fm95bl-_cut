@@ -41,6 +41,8 @@ DROP_HEURISTIC_DUR    = 60.0   # heuristic-only cuts shorter than this → [DROP
 DROP_SHAZAM_DUR       = 30.0   # Shazam cuts shorter than this → [DROP?]
 SHAZAM_CONFUSED_DUR   = 45.0   # Shazam cut < this AND much shorter than heuristic region
 SHAZAM_CONFUSED_RATIO = 3.0    # ...when heuristic region > Shazam cut * this ratio
+TAIL_EXT_MARGIN       = 5.0    # pull back this far from last scan-confirmed music when
+                               # auto-applying a same-song tail extension (errs short)
 
 
 def hms(s: float) -> str:
@@ -110,9 +112,17 @@ def classify(row: dict) -> tuple[str, str, float, float]:
         if gs_song and gs_type == "new_gap_find":
             gs_s   = _float(row.get("gap_shazam_start"))
             gs_e   = _float(row.get("gap_shazam_end"))
-            gs_dur = gs_e - gs_s
             gs_unc = (row.get("gap_shazam_status") or "").strip() == "UNCERTAIN"
             gs_hits = _int(row.get("gap_shazam_n_hits"))
+            # END floor: the last scan-confirmed music beats the DB-duration
+            # projection when the DB has a bogus short duration (e.g. a 29s
+            # "duration" for Pitbull capped the cut at 37s and blocked AUTO).
+            # Safe: every second up to last_confirmed was positively heard as
+            # this song by the scan windows.
+            gs_last_conf = _float(row.get("gap_shazam_last_confirmed"))
+            if gs_hits >= 2 and gs_last_conf - TAIL_EXT_MARGIN > gs_e:
+                gs_e = gs_last_conf - TAIL_EXT_MARGIN
+            gs_dur = gs_e - gs_s
             if gs_dur < DROP_SHAZAM_DUR:
                 return "DROP?", "gap_shazam_too_short", gs_s, gs_e
             if (not gs_unc and gs_hits >= AUTO_MIN_HITS and gs_dur >= AUTO_MIN_DURATION):
@@ -218,7 +228,6 @@ def main() -> None:
 
     for row in rows:
         label, reason, cut_s, cut_e = classify(row)
-        dur = cut_e - cut_s
 
         # Gap-shazam extension — added as a sibling [EXT] entry later
         gs_song  = (row.get("gap_shazam_song") or "").strip()
@@ -226,6 +235,25 @@ def main() -> None:
         gs_end   = _float(row.get("gap_shazam_end"))
         gs_type  = (row.get("gap_shazam_type") or "").strip()
         gs_unc   = (row.get("gap_shazam_status") or "") == "UNCERTAIN"
+
+        # Auto-apply same-song tail extension to AUTO cuts. The gap scan heard
+        # the SAME song still playing past this cut's end, so the end ran short
+        # (the "tail" pattern, ~80s on the worst cases). Extend only to the last
+        # scan-CONFIRMED music minus a margin — never to the DB-duration
+        # projection (gap_shazam_end), which overshoots into host talk when the
+        # DB has the album edit.
+        tail_extended = False
+        m_song = (row.get("matched_song") or "").strip()
+        gs_last_conf = _float(row.get("gap_shazam_last_confirmed"))
+        if (label == "AUTO" and gs_type == "extension"
+                and gs_song and m_song
+                and gs_song.lower() == m_song.lower()
+                and gs_last_conf - TAIL_EXT_MARGIN > cut_e):
+            cut_e = gs_last_conf - TAIL_EXT_MARGIN
+            reason += "+tail_extended"
+            tail_extended = True
+
+        dur = cut_e - cut_s
 
         # When the row was classified off the gap-scan match (a new_gap_find),
         # surface the gap-scan song + hit count instead of the empty normal-Shazam
@@ -271,8 +299,9 @@ def main() -> None:
             "notes":              "",
         })
 
-        # Add sibling [EXT] row for gap-scan extensions
-        if gs_song and gs_type == "extension" and gs_end > gs_start:
+        # Add sibling [EXT] row for gap-scan extensions (skipped when the
+        # extension was already auto-applied to the AUTO row above)
+        if gs_song and gs_type == "extension" and gs_end > gs_start and not tail_extended:
             gs_flag = " ⚠" if gs_unc else " ✓"
             classified.append({
                 "label":               "EXT",

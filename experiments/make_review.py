@@ -56,6 +56,9 @@ from pathlib import Path
 GAP_MERGE_OVERLAP = 30.0
 # Maximum gap between same-song regions to consider merging them
 SAME_SONG_MAX_GAP = 120.0
+# Minimum uncovered chunk of a Shazam-narrowed heuristic region to surface
+# as a region_remainder review row (may hide a second, unmatched song)
+REMAINDER_MIN_DUR = 180.0
 
 
 def hms(s: float) -> str:
@@ -70,6 +73,26 @@ def overlap_s(a0: float, a1: float, b0: float, b1: float) -> float:
 
 def _song_name(row: dict) -> str:
     return (row.get("matched_song") or "").lower().strip()
+
+
+def gap_last_confirmed(gs: dict) -> float | str:
+    """
+    Last episode time at which the gap scan positively heard the song:
+    song_start + last matched window offset + clip length. Unlike
+    suggested_end (song_start + DB duration), this cannot overshoot into
+    host talk when the DB duration is the album edit — it errs short.
+    """
+    offs = gs.get("all_offsets") or []
+    if not offs or gs.get("song_start_in_episode") in (None, ""):
+        return ""
+    clip_len = 15.0
+    try:
+        cl = float(gs.get("clip_end", 0)) - float(gs.get("clip_start", 0))
+        if cl > 0:
+            clip_len = cl
+    except (TypeError, ValueError):
+        pass
+    return round(float(gs["song_start_in_episode"]) + max(offs) + clip_len, 1)
 
 
 def merge_same_song_rows(rows: list[dict], max_gap_s: float = SAME_SONG_MAX_GAP) -> list[dict]:
@@ -415,6 +438,7 @@ def main() -> None:
         row.setdefault("gap_shazam_type",              "")
         row.setdefault("gap_shazam_n_hits",            "")
         row.setdefault("gap_shazam_uncertain_reasons", "")
+        row.setdefault("gap_shazam_last_confirmed",    "")
 
     used_gs: set[int] = set()
 
@@ -442,6 +466,7 @@ def main() -> None:
             row["gap_shazam_type"]              = gs_type
             row["gap_shazam_n_hits"]            = gs.get("n_windows_matched", "")
             row["gap_shazam_uncertain_reasons"] = "; ".join(gs.get("uncertain_reasons", []))
+            row["gap_shazam_last_confirmed"]    = gap_last_confirmed(gs)
             row["region_type"]                  = row["region_type"] + "+gap_shazam"
 
     # Stage 2b: standalone gap-shazam rows (not overlapping anything above)
@@ -469,7 +494,64 @@ def main() -> None:
             "gap_shazam_type":             gs_type,
             "gap_shazam_n_hits":           gs.get("n_windows_matched", ""),
             "gap_shazam_uncertain_reasons": "; ".join(gs.get("uncertain_reasons", [])),
+            "gap_shazam_last_confirmed":   gap_last_confirmed(gs),
         })
+
+    # Stage 2c: region-remainder rows. When Shazam narrows a wide heuristic
+    # region to just the matched song, the rest of the region silently vanishes
+    # from every output — and can hide a second (often Icelandic, unmatchable)
+    # song. Surface any uncovered chunk >= REMAINDER_MIN_DUR as its own
+    # review row so it stays visible in Audacity. These rows have no Shazam
+    # match, so they classify as REVIEW-H and can never touch AUTO precision.
+    covered = []
+    for row in rows:
+        if row["suggested_start"] != "" and row["suggested_end"] != "":
+            covered.append((float(row["suggested_start"]), float(row["suggested_end"])))
+        if row["gap_shazam_start"] != "" and row["gap_shazam_end"] != "":
+            covered.append((float(row["gap_shazam_start"]), float(row["gap_shazam_end"])))
+
+    remainder_rows: list[dict] = []
+    for row in rows:
+        if not (row.get("heuristic_start") and row.get("heuristic_end")):
+            continue
+        if not (row.get("matched_song") or "").strip():
+            continue  # nothing was narrowed away
+        segs = [(float(row["heuristic_start"]), float(row["heuristic_end"]))]
+        for cs, ce in covered:
+            nxt = []
+            for s0, s1 in segs:
+                if cs < s1 and ce > s0:
+                    if cs - s0 > 1:
+                        nxt.append((s0, cs))
+                    if s1 - ce > 1:
+                        nxt.append((ce, s1))
+                else:
+                    nxt.append((s0, s1))
+            segs = nxt
+        for s0, s1 in segs:
+            if s1 - s0 < REMAINDER_MIN_DUR:
+                continue
+            remainder_rows.append({
+                "region_type":       "region_remainder",
+                "heuristic_start":   row["heuristic_start"],
+                "heuristic_end":     row["heuristic_end"],
+                "heuristic_conf":    row.get("heuristic_conf", ""),
+                "matched_song":      "",
+                "shazam_status":     "unmatched",
+                "uncertain_reasons": "",
+                "suggested_start":   round(s0, 1),
+                "suggested_end":     round(s1, 1),
+                "gap_shazam_song":   "", "gap_shazam_start": "", "gap_shazam_end": "",
+                "gap_shazam_status": "", "gap_shazam_type": "", "gap_shazam_n_hits": "",
+                "gap_shazam_uncertain_reasons": "", "gap_shazam_last_confirmed": "",
+            })
+    if remainder_rows:
+        print(f"\nRegion remainders: {len(remainder_rows)} uncovered chunk(s) >= "
+              f"{REMAINDER_MIN_DUR:.0f}s surfaced for review")
+        for r in remainder_rows:
+            print(f"  remainder {hms(float(r['suggested_start']))}–{hms(float(r['suggested_end']))}"
+                  f"  (from region {r['heuristic_start']}–{r['heuristic_end']})")
+    rows.extend(remainder_rows)
 
     rows.sort(key=lambda r: (
         float(r["suggested_start"]) if r["suggested_start"] != "" else 0.0
@@ -507,6 +589,7 @@ def main() -> None:
         # Gap-shazam columns
         "gap_shazam_song", "gap_shazam_start", "gap_shazam_end",
         "gap_shazam_status", "gap_shazam_type", "gap_shazam_n_hits", "gap_shazam_uncertain_reasons",
+        "gap_shazam_last_confirmed",
         # Merge info
         "merge_note",
         # Fill these in during review
@@ -551,6 +634,7 @@ def main() -> None:
                 "gap_shazam_type":             r.get("gap_shazam_type", ""),
                 "gap_shazam_n_hits":           r.get("gap_shazam_n_hits", ""),
                 "gap_shazam_uncertain_reasons": r.get("gap_shazam_uncertain_reasons", ""),
+                "gap_shazam_last_confirmed":   r.get("gap_shazam_last_confirmed", ""),
                 "merge_note":          r.get("merge_note", ""),
                 "actual_start":    "", "actual_end":     "",
                 "actual_start_hms":"","actual_end_hms": "",
