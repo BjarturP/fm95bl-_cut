@@ -17,12 +17,12 @@ Automatically detect and cut **music breaks** from Icelandic FM95Blö podcast/ra
 | Field | Value |
 |---|---|
 | Branch | `main` |
-| Latest commit | `4cae80b` — "Auto-apply scan-confirmed tail extensions and surface narrowed-region remainders" (2026-07-25) |
-| Prev commits | `4bbcf23` (Session 13 fixes, cross-validated), `6700798` (word-clawback) |
+| Latest commit | `03201a3` — "Make transcription crash-safe: checkpoint every segment, resume on rerun" (2026-07-26) |
+| Prev commits | `6975fc7` (run_full_pipeline.sh), `92338e6` (cross-episode matcher), `435d12b` (host-talk safety) |
 | Working tree | Clean of code changes; this note + untracked data outputs only |
-| Ahead of remote | 9 commits |
+| Ahead of remote | 0 — everything pushed |
 
-**All Session 13 fixes are COMMITTED (`4bbcf23`)** after passing full cross-validation on 2011-11-09 and 2012-03-09 (Session 14). Session 14 improvements committed in `4cae80b`.
+**New episode workflow is one command:** `caffeinate -i zsh scripts/run_full_pipeline.sh <ep>` (audio at `episodes/<ep>-mp3.mp3`). Transcription checkpoints every segment and resumes on rerun after a crash. Run under `caffeinate` — macOS killed two multi-hour transcriptions (memory pressure/sleep) before this.
 
 **Untracked data (not committed, normal):**
 - `data/{transcripts,features,candidates}/fm95blo-2012-*.json` (per-episode pipeline outputs)
@@ -799,6 +799,27 @@ Three breaks recovered as AUTO: **GT3 → David Guetta – Titanium** (the split
 - `scripts/sim_merge_gate.py` — the offline merge-threshold simulation across all 4 labeled episodes (the pre-edit validation for fix #1; re-run to justify any future threshold change). `PYTHONPATH=. .venv/bin/python scripts/sim_merge_gate.py`
 - `scripts/eval_hybrid_vs_gt.py` — scores `hybrid_review_<ep>.csv` against a GT file (AUTO precision/recall, per-GT boundary table). Currently hardcoded to 2012-01-30; generalize the paths for other episodes.
 - `scripts/rerun_downstream.sh <ep>` — re-runs stages 5-8 (review_export → shazam → gap_scan → make_review) after a finalize change. For a full re-validation, run `finalize_cuts.py` first, then this.
+
+---
+
+### 2026-07-26 — Session 17: 6th episode fm95blo-2012-01-06 + crash-safe transcription
+
+**Icelandic work PAUSED by user** ("we will figure that out later") — rotation database still grows passively with each episode.
+
+**Reliability (`03201a3`, `6975fc7`):**
+- macOS killed the 01-06 transcription at ~85% (second system kill in two days; user confirmed not them — memory pressure suspected on the 8GB machine). Restart under `caffeinate -i` completed cleanly.
+- `transcribe.py` is now crash-safe: every segment appends to `<out>.json.partial.jsonl` immediately; rerunning resumes from the last checkpoint (ffmpeg-trims remaining audio, shifts timestamps). Sidecar deleted on success; `--no-resume` forces fresh. Checkpoint parsing unit-tested; full resume path not yet exercised by a real crash.
+- `scripts/run_full_pipeline.sh <ep>` — parameterized one-command pipeline for new episodes.
+
+**fm95blo-2012-01-06 results (NO GT yet — user has not labeled):**
+- 8 AUTO cuts / 27.1 min: Pitbull, R.E.M., Azealia Banks, **Of Monsters and Men – King and Lionheart** (Icelandic band, in Shazam because of their international 2012 breakout), Bruno Mars, JAY-Z & Kanye, Coldplay – The Scientist, The Wanted.
+- 2 REVIEW-S: Calvin Harris (start spread 61s), Avicii – Levels (single hit).
+- **7 REVIEW-H unknowns, unusually many and long** (3:32–7:10, 39:15–45:59, 46:55–48:47, 50:30–57:02, 1:13:28–1:14:50, 1:36:03–1:43:16, 1:46:55–1:55:42) — this January episode is heavy on unnamed/likely-Icelandic content. Prime material for the paused cross-episode matcher.
+- Pipeline timing: transcribe 1h43m, total ~2h18m.
+
+**Next:** user labels 01-06 GT (`music - MM:SS - MM:SS` + where the show ends) → score vs the 48/48 streak.
+
+**Commits made:** `03201a3`, `6975fc7`, note update (this entry). Pushed.
 
 ---
 
